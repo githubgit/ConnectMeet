@@ -132,7 +132,7 @@ export const VideoTile: React.FC<VideoTileProps> = ({ participant, isLocal = fal
           <img 
             src={participant.avatarUrl} 
             alt={participant.name} 
-            className="w-24 h-24 rounded-full border-4 border-gray-600"
+            className="h-[60%] max-h-[300px] aspect-square rounded-full border-4 border-gray-600 object-cover shadow-2xl"
           />
         </div>
       ) : (
@@ -168,11 +168,6 @@ export const VideoTile: React.FC<VideoTileProps> = ({ participant, isLocal = fal
          <div className="bg-black/40 backdrop-blur-sm p-1 rounded-full">
             <Wifi size={14} className={getQualityColor(participant.connectionQuality)} />
          </div>
-         {participant.isBlurredBackground && !participant.isVideoOff && (
-            <div className="bg-primary-600/80 backdrop-blur-sm p-1 rounded-full" title="Background Blur On">
-                <Aperture size={14} className="text-white" />
-            </div>
-         )}
       </div>
 
       {/* Floating Reactions */}

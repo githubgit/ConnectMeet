@@ -10,7 +10,7 @@ import { ChatPanel } from './components/ChatPanel';
 import { 
   Mic, MicOff, Video, VideoOff, PhoneOff, 
   MessageSquare, Users, MoreVertical, Settings, 
-  Share, Smile, MonitorUp, Copy, Link, Check, User as UserIcon, ArrowRight, Aperture
+  Share, Smile, MonitorUp, Copy, Link, Check, User as UserIcon, ArrowRight, Aperture, Image as ImageIcon
 } from 'lucide-react';
 
 const App: React.FC = () => {
@@ -28,6 +28,7 @@ const App: React.FC = () => {
   
   // Login Input State
   const [nameInput, setNameInput] = useState('');
+  const [avatarInput, setAvatarInput] = useState('');
 
   // Controls State
   const [isMuted, setIsMuted] = useState(false);
@@ -45,15 +46,17 @@ const App: React.FC = () => {
   const localStreamRef = useRef<MediaStream | null>(null);
   const connectionsRef = useRef<{ [peerId: string]: DataConnection }>({});
   const callsRef = useRef<{ [peerId: string]: MediaConnection }>({});
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // --- Effects ---
 
-  // Load saved name from local storage on mount
+  // Load saved settings from local storage on mount
   useEffect(() => {
     const savedName = localStorage.getItem('connect_meet_username');
-    if (savedName) {
-      setNameInput(savedName);
-    }
+    if (savedName) setNameInput(savedName);
+    
+    const savedAvatar = localStorage.getItem('connect_meet_avatar');
+    if (savedAvatar) setAvatarInput(savedAvatar);
   }, []);
 
   // Helper to start media stream
@@ -408,13 +411,42 @@ const App: React.FC = () => {
       }));
   };
 
+  const handleTriggerAvatarUpload = (e: React.MouseEvent) => {
+    e.preventDefault();
+    fileInputRef.current?.click();
+  };
+
+  const handleAvatarFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // Check size (2MB limit)
+    if (file.size > 2 * 1024 * 1024) {
+        setToastMessage("Image too large. Please choose an image under 2MB.");
+        return;
+    }
+
+    const reader = new FileReader();
+    reader.onloadend = () => {
+        const result = reader.result as string;
+        setAvatarInput(result);
+        try {
+            localStorage.setItem('connect_meet_avatar', result);
+        } catch (err) {
+            console.warn("Avatar too large to save in local storage", err);
+            setToastMessage("Avatar set, but couldn't be saved for next time.");
+        }
+    };
+    reader.readAsDataURL(file);
+  };
+
   const handleJoinMeeting = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (!nameInput.trim()) return;
 
     const trimmedName = nameInput.trim();
     localStorage.setItem('connect_meet_username', trimmedName);
-
+    
     // Ensure we have streams before joining
     if (localStreamRef.current) {
          const videoTrack = localStreamRef.current.getVideoTracks()[0];
@@ -453,10 +485,12 @@ const App: React.FC = () => {
         }
     }
 
+    const finalAvatarUrl = avatarInput.trim() || `https://ui-avatars.com/api/?name=${encodeURIComponent(trimmedName)}&background=2563eb&color=fff`;
+
     const newUser: User = {
         id: 'temp-init', 
         name: trimmedName,
-        avatarUrl: `https://ui-avatars.com/api/?name=${encodeURIComponent(trimmedName)}&background=2563eb&color=fff`,
+        avatarUrl: finalAvatarUrl,
         isHost: !hostId
     };
 
@@ -601,7 +635,7 @@ const App: React.FC = () => {
   const previewParticipant: Participant = {
     id: 'preview',
     name: nameInput || 'You',
-    avatarUrl: `https://ui-avatars.com/api/?name=${encodeURIComponent(nameInput || 'You')}&background=2563eb&color=fff`,
+    avatarUrl: avatarInput.trim() || `https://ui-avatars.com/api/?name=${encodeURIComponent(nameInput || 'You')}&background=2563eb&color=fff`,
     isHost: false,
     isMuted,
     isVideoOff,
@@ -626,8 +660,8 @@ const App: React.FC = () => {
                 <div className="aspect-video bg-gray-800 rounded-2xl overflow-hidden relative shadow-2xl border border-gray-700">
                     {isVideoOff ? (
                          <div className="w-full h-full flex items-center justify-center bg-gray-900">
-                            <div className="w-32 h-32 rounded-full overflow-hidden border-4 border-gray-700">
-                                <img src={previewParticipant.avatarUrl} alt="Me" referrerPolicy="no-referrer" />
+                            <div className="h-[60%] aspect-square rounded-full overflow-hidden border-4 border-gray-700 shadow-2xl">
+                                <img src={previewParticipant.avatarUrl} alt="Me" referrerPolicy="no-referrer" className="w-full h-full object-cover"/>
                             </div>
                          </div>
                     ) : (
@@ -667,6 +701,21 @@ const App: React.FC = () => {
                          >
                             <Aperture />
                          </Button>
+                         <Button
+                            variant="secondary"
+                            size="icon"
+                            onClick={handleTriggerAvatarUpload}
+                            tooltip="Upload Avatar"
+                         >
+                            <ImageIcon />
+                         </Button>
+                         <input 
+                            type="file" 
+                            ref={fileInputRef}
+                            className="hidden" 
+                            accept="image/*"
+                            onChange={handleAvatarFileChange}
+                         />
                     </div>
                 </div>
                 <div className="text-center text-sm text-gray-500">
@@ -701,6 +750,8 @@ const App: React.FC = () => {
                             />
                         </div>
                      </div>
+                     
+                     {/* Avatar URL input removed as requested */}
                      
                      {hostId && (
                         <div className="bg-gray-800/50 rounded-lg p-3 border border-gray-700 flex items-center justify-between">
