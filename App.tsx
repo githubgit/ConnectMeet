@@ -111,6 +111,8 @@ const App: React.FC = () => {
         // Update local participant state
         setParticipants(prev => prev.map(p => {
             if (p.id === localUser.id) {
+                // If stream ref has changed (handled in toggleCamera/Mic), we keep the current one from prev unless explicitly updated elsewhere
+                // But here we mainly update flags.
                 return { ...p, isMuted, isVideoOff, isScreenSharing, isBlurredBackground };
             }
             return p;
@@ -152,14 +154,30 @@ const App: React.FC = () => {
             localStreamRef.current.getAudioTracks().forEach(t => {
                 t.stop();
             });
+            // We keep the stream object but tracks are dead.
         } else {
             // Restart Mic
             try {
                 const audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
                 const newTrack = audioStream.getAudioTracks()[0];
                 
-                localStreamRef.current.getAudioTracks().forEach(t => localStreamRef.current?.removeTrack(t));
-                localStreamRef.current.addTrack(newTrack);
+                // Construct a NEW stream to force reactivity and browser refresh
+                const currentVideoTracks = localStreamRef.current.getVideoTracks();
+                // Filter out stopped tracks from current stream before creating new one
+                const activeVideoTracks = currentVideoTracks.filter(t => t.readyState !== 'ended');
+                
+                const newStream = new MediaStream([...activeVideoTracks, newTrack]);
+                localStreamRef.current = newStream;
+
+                // Update participant state with new stream
+                if (localUser) {
+                    setParticipants(prev => prev.map(p => {
+                        if (p.id === localUser.id || p.id === 'local-temp') {
+                            return { ...p, stream: newStream };
+                        }
+                        return p;
+                    }));
+                }
                 
                 // If in meeting, replace track for all peers
                 if (meetingState === MeetingState.IN_MEETING) {
@@ -196,8 +214,23 @@ const App: React.FC = () => {
                 const videoStream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
                 const newTrack = videoStream.getVideoTracks()[0];
                 
-                localStreamRef.current.getVideoTracks().forEach(t => localStreamRef.current?.removeTrack(t));
-                localStreamRef.current.addTrack(newTrack);
+                // Construct a NEW stream to force reactivity and browser refresh
+                const currentAudioTracks = localStreamRef.current.getAudioTracks();
+                // Filter out stopped tracks
+                const activeAudioTracks = currentAudioTracks.filter(t => t.readyState !== 'ended');
+
+                const newStream = new MediaStream([...activeAudioTracks, newTrack]);
+                localStreamRef.current = newStream;
+                
+                // Update participant state with new stream
+                if (localUser) {
+                    setParticipants(prev => prev.map(p => {
+                        if (p.id === localUser.id || p.id === 'local-temp') {
+                            return { ...p, stream: newStream };
+                        }
+                        return p;
+                    }));
+                }
                 
                 // If in meeting, replace track for all peers
                 if (meetingState === MeetingState.IN_MEETING) {
@@ -448,34 +481,15 @@ const App: React.FC = () => {
     localStorage.setItem('connect_meet_username', trimmedName);
     
     // Ensure we have streams before joining
-    if (localStreamRef.current) {
-         const videoTrack = localStreamRef.current.getVideoTracks()[0];
-         const audioTrack = localStreamRef.current.getAudioTracks()[0];
-         let needRefresh = false;
-
-         if (!videoTrack || videoTrack.readyState === 'ended') needRefresh = true;
-         if (!audioTrack || audioTrack.readyState === 'ended') needRefresh = true;
-
-         if (needRefresh) {
-             try {
-                const newStream = await navigator.mediaDevices.getUserMedia({ 
-                    video: { width: 640, height: 480 }, 
-                    audio: true 
-                });
-                // Clean up old
-                localStreamRef.current.getTracks().forEach(t => t.stop());
-                localStreamRef.current = newStream;
-                setStreamReady(true);
-             } catch (err) {
-                 setToastMessage("Failed to initialize media");
-                 return;
-             }
-         }
-    } else {
+    // If streams are stopped (because video/mic was toggled off), we might need to refresh them to ensure we have a valid stream object to pass, even if tracks are stopped.
+    // Actually, we just need to make sure localStreamRef.current exists.
+    if (!localStreamRef.current) {
         await startMediaStream();
     }
     
-    // Apply initial mute states by stopping tracks if necessary
+    // Apply initial mute states by stopping tracks if necessary. 
+    // If they were already stopped in Lobby, this is redundant but safe.
+    // If they were active (e.g. from startMediaStream above), this stops them.
     if (localStreamRef.current) {
         if (isMuted) {
             localStreamRef.current.getAudioTracks().forEach(t => t.stop());
@@ -659,8 +673,8 @@ const App: React.FC = () => {
             <div className="space-y-4">
                 <div className="aspect-video bg-gray-800 rounded-2xl overflow-hidden relative shadow-2xl border border-gray-700">
                     {isVideoOff ? (
-                         <div className="w-full h-full flex items-center justify-center bg-gray-900">
-                            <div className="h-[60%] aspect-square rounded-full overflow-hidden border-4 border-gray-700 shadow-2xl">
+                         <div className="w-full h-full flex items-center justify-center bg-gray-900 pb-12">
+                            <div className="h-[85%] aspect-square rounded-full overflow-hidden border-4 border-gray-700 shadow-2xl">
                                 <img src={previewParticipant.avatarUrl} alt="Me" referrerPolicy="no-referrer" className="w-full h-full object-cover"/>
                             </div>
                          </div>
@@ -864,6 +878,15 @@ const App: React.FC = () => {
                     tooltip="Chat"
                 >
                     <MessageSquare size={20} />
+                </Button>
+                
+                <Button
+                    variant="secondary"
+                    size="icon"
+                    onClick={handleCopyLink}
+                    tooltip="Copy Invite Link"
+                >
+                    <Share size={20} />
                 </Button>
 
                 <div className="relative group">
