@@ -70,9 +70,6 @@ const App: React.FC = () => {
         });
         localStreamRef.current = stream;
         
-        // We do not set track enabled state here manually.
-        // We rely on the sync effect below which triggers on streamReady change.
-        
         setStreamReady(true);
         setToastMessage(null);
       } catch (err) {
@@ -92,7 +89,7 @@ const App: React.FC = () => {
             localStreamRef.current.getTracks().forEach(track => track.stop());
         }
     };
-  }, [startMediaStream]); // Run once on mount (startMediaStream is stable)
+  }, [startMediaStream]);
 
   // Cleanup reactions automatically
   useEffect(() => {
@@ -107,9 +104,15 @@ const App: React.FC = () => {
 
   // Sync local controls to stream and participant state
   useEffect(() => {
+    // Only apply enabled/disabled logic if tracks are LIVE. 
+    // In Lobby, we might stop tracks completely.
     if (localStreamRef.current) {
-        localStreamRef.current.getAudioTracks().forEach(t => t.enabled = !isMuted);
-        localStreamRef.current.getVideoTracks().forEach(t => t.enabled = !isVideoOff);
+        localStreamRef.current.getAudioTracks().forEach(t => {
+            if (t.readyState === 'live') t.enabled = !isMuted;
+        });
+        localStreamRef.current.getVideoTracks().forEach(t => {
+            if (t.readyState === 'live') t.enabled = !isVideoOff;
+        });
     }
 
     if (meetingState === MeetingState.IN_MEETING && localUser) {
@@ -125,7 +128,7 @@ const App: React.FC = () => {
         broadcastData({
             type: 'UPDATE_STATE',
             payload: {
-                peerId: localUser.id, // Using user ID as peer ID in this simplified model
+                peerId: localUser.id, 
                 isMuted,
                 isVideoOff,
                 isBlurredBackground
@@ -146,44 +149,94 @@ const App: React.FC = () => {
 
   // --- Handlers ---
 
+  // Enhanced Toggle Handlers for Lobby (Stop tracks completely)
+  const toggleMic = async () => {
+    const newMuted = !isMuted;
+    setIsMuted(newMuted);
+
+    if (meetingState === MeetingState.LOBBY && localStreamRef.current) {
+        if (newMuted) {
+            // Stop tracks to release hardware in Lobby
+            localStreamRef.current.getAudioTracks().forEach(t => {
+                t.stop();
+                t.enabled = false;
+            });
+        } else {
+            // Restart Mic
+            try {
+                const audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                const newTrack = audioStream.getAudioTracks()[0];
+                
+                localStreamRef.current.getAudioTracks().forEach(t => localStreamRef.current?.removeTrack(t));
+                localStreamRef.current.addTrack(newTrack);
+                setStreamReady(prev => !prev); // Force refresh
+            } catch (e) {
+                console.error("Mic restart failed", e);
+                setIsMuted(true);
+                setToastMessage("Could not access microphone");
+            }
+        }
+    }
+  };
+
+  const toggleCamera = async () => {
+    const newVideoOff = !isVideoOff;
+    setIsVideoOff(newVideoOff);
+
+    if (meetingState === MeetingState.LOBBY && localStreamRef.current) {
+        if (newVideoOff) {
+            // Stop tracks to turn off camera light
+            localStreamRef.current.getVideoTracks().forEach(t => {
+                t.stop();
+                t.enabled = false;
+            });
+        } else {
+            // Restart Camera
+            try {
+                const videoStream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+                const newTrack = videoStream.getVideoTracks()[0];
+                
+                localStreamRef.current.getVideoTracks().forEach(t => localStreamRef.current?.removeTrack(t));
+                localStreamRef.current.addTrack(newTrack);
+                setStreamReady(prev => !prev); // Force refresh
+            } catch (e) {
+                console.error("Camera restart failed", e);
+                setIsVideoOff(true);
+                setToastMessage("Could not access camera");
+            }
+        }
+    }
+  };
+
   const initializePeer = async (user: User) => {
-      // Import PeerJS dynamically if needed or assume it's global/imported
-      // const { default: Peer } = await import('peerjs');
-      
-      const peer = new Peer(hostId ? undefined : undefined); // If host, let PeerJS generate random ID, or we could force one.
+      const peer = new Peer(hostId ? undefined : undefined); 
 
       peer.on('open', (id) => {
           console.log('My peer ID is: ' + id);
           
           if (!hostId) {
-              // I am the host, my ID is the meeting ID
               setMeetingId(id);
-              // Update URL without reload
               const newUrl = `${window.location.pathname}?meet=${id}`;
               try {
                   window.history.pushState({ path: newUrl }, '', newUrl);
               } catch (e) {
-                  console.warn("Could not push history state (likely blob/sandbox environment):", e);
+                  console.warn("History push failed:", e);
               }
           }
 
-          // Update local user ID to match Peer ID for consistency
           setLocalUser(prev => prev ? { ...prev, id: id } : { ...user, id: id });
           peerRef.current = peer;
 
-          // If I am a guest, connect to the host immediately
           if (hostId) {
              connectToHost(hostId, peer, id, user);
           }
       });
 
       peer.on('connection', (conn) => {
-          console.log('Incoming connection from:', conn.peer);
           handleDataConnection(conn);
       });
 
       peer.on('call', (call) => {
-          console.log('Incoming call from:', call.peer);
           if (localStreamRef.current) {
               call.answer(localStreamRef.current);
               handleMediaCall(call);
@@ -197,13 +250,11 @@ const App: React.FC = () => {
   };
 
   const connectToHost = (hostPeerId: string, peer: Peer, myId: string, user: User) => {
-      // 1. Data Connection (for chat, state sync)
       const conn = peer.connect(hostPeerId, {
           metadata: { name: user.name, avatarUrl: user.avatarUrl }
       });
       handleDataConnection(conn, user);
 
-      // 2. Media Connection
       if (localStreamRef.current) {
           const call = peer.call(hostPeerId, localStreamRef.current);
           handleMediaCall(call);
@@ -214,12 +265,7 @@ const App: React.FC = () => {
       connectionsRef.current[conn.peer] = conn;
 
       conn.on('open', () => {
-          console.log('Data connection open with:', conn.peer);
-          // Send my details
-          // We need current localUser, but inside callback it might be stale if we don't use ref or pass it.
-          // If called during init, use passed userContext. If called later (host receiving guest), use localUser state (which should be set).
           const userToSend = userContext || localUser;
-
           if (userToSend) {
               conn.send({
                   type: 'USER_INFO',
@@ -239,7 +285,6 @@ const App: React.FC = () => {
       });
 
       conn.on('close', () => {
-          console.log('Connection closed:', conn.peer);
           removeParticipant(conn.peer);
       });
   };
@@ -248,7 +293,6 @@ const App: React.FC = () => {
       callsRef.current[call.peer] = call;
 
       call.on('stream', (remoteStream) => {
-          console.log('Received stream from:', call.peer);
           setParticipants(prev => prev.map(p => {
               if (p.id === call.peer) {
                   return { ...p, stream: remoteStream };
@@ -277,22 +321,15 @@ const App: React.FC = () => {
               addReaction(data.payload.peerId, data.payload.emoji);
               break;
           case 'PEER_LIST':
-               // Received by guest from host. Need to connect to these other peers.
-               // Mesh Networking: Everyone connects to everyone.
-               // data.payload = [{id, ...}, {id, ...}]
                data.payload.forEach((peerInfo: any) => {
                    if (peerInfo.id !== peerRef.current?.id && !connectionsRef.current[peerInfo.id]) {
-                       // Initiate connection to this existing peer
                        connectToPeer(peerInfo.id); 
                    }
                });
                break;
       }
 
-      // If I am Host, and I get a USER_INFO from a new Guest, 
-      // I should introduce them to everyone else (or send them the list).
       if (!hostId && data.type === 'USER_INFO') {
-          // Send the current list of peers (excluding the new guy) to the new guy
           const existingPeers = participants.filter(p => p.id !== senderPeerId && p.id !== localUser?.id).map(p => ({ id: p.id }));
           
           if (existingPeers.length > 0) {
@@ -323,7 +360,7 @@ const App: React.FC = () => {
               id: id,
               name: info.name || 'Guest',
               avatarUrl: info.avatarUrl || `https://ui-avatars.com/api/?name=Guest`,
-              isHost: false, // In mesh, only the original creator is conceptually host, but peers are equal
+              isHost: false, 
               isMuted: info.isMuted || false,
               isVideoOff: info.isVideoOff || false,
               isScreenSharing: false,
@@ -364,16 +401,50 @@ const App: React.FC = () => {
       }));
   };
 
-  const handleJoinMeeting = (e?: React.FormEvent) => {
+  const handleJoinMeeting = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (!nameInput.trim()) return;
 
     const trimmedName = nameInput.trim();
     localStorage.setItem('connect_meet_username', trimmedName);
 
-    // Create User Object
+    // CRITICAL: Ensure we have live tracks before joining.
+    // If user muted/turned off camera in lobby, tracks might be stopped.
+    // We must restart them to have valid MediaStream for WebRTC negotiation, 
+    // even if we immediately set enabled=false.
+    if (localStreamRef.current) {
+         const videoTrack = localStreamRef.current.getVideoTracks()[0];
+         const audioTrack = localStreamRef.current.getAudioTracks()[0];
+         let needRefresh = false;
+
+         if (!videoTrack || videoTrack.readyState === 'ended') needRefresh = true;
+         if (!audioTrack || audioTrack.readyState === 'ended') needRefresh = true;
+
+         if (needRefresh) {
+             try {
+                const newStream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { width: 640, height: 480 }, 
+                    audio: true 
+                });
+                // Clean up old
+                localStreamRef.current.getTracks().forEach(t => t.stop());
+                
+                localStreamRef.current = newStream;
+                // Apply current mute state
+                newStream.getAudioTracks().forEach(t => t.enabled = !isMuted);
+                newStream.getVideoTracks().forEach(t => t.enabled = !isVideoOff);
+                setStreamReady(true);
+             } catch (err) {
+                 setToastMessage("Failed to initialize media");
+                 return;
+             }
+         }
+    } else {
+        await startMediaStream();
+    }
+
     const newUser: User = {
-        id: 'temp-init', // PeerJS will assign real ID
+        id: 'temp-init', 
         name: trimmedName,
         avatarUrl: `https://ui-avatars.com/api/?name=${encodeURIComponent(trimmedName)}&background=2563eb&color=fff`,
         isHost: !hostId
@@ -382,7 +453,6 @@ const App: React.FC = () => {
     setLocalUser(newUser);
     initializePeer(newUser);
     
-    // Set initial local participant for the grid
     if (localStreamRef.current) {
         setParticipants([{
             ...newUser,
@@ -428,7 +498,6 @@ const App: React.FC = () => {
     
     setMessages(prev => [...prev, newMessage]);
 
-    // Broadcast if not AI internal
     if (!isAiQuery) {
         broadcastData({
             type: 'CHAT_MESSAGE',
@@ -439,11 +508,7 @@ const App: React.FC = () => {
 
   const handleReaction = (emoji: string) => {
     if (!localUser) return;
-    
-    // Local Update
     addReaction(localUser.id, emoji);
-    
-    // Broadcast
     broadcastData({
         type: 'REACTION',
         payload: {
@@ -454,7 +519,6 @@ const App: React.FC = () => {
   };
   
   const handleCopyLink = () => {
-    // If we are host and just started, meetingId might be null briefly, but UI handles that.
     const idToShare = meetingId || hostId; 
     const link = `${window.location.origin}${window.location.pathname}?meet=${idToShare}`;
     navigator.clipboard.writeText(link).then(() => {
@@ -467,42 +531,34 @@ const App: React.FC = () => {
   };
 
   const handleLeaveMeeting = () => {
-    // 1. Cleanup WebRTC connections
     if (peerRef.current) {
         peerRef.current.destroy();
         peerRef.current = null;
     }
-    
-    // 2. Stop Camera/Mic tracks
     if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach(track => track.stop());
         localStreamRef.current = null;
     }
-
-    // 3. Reset all state variables
     setParticipants([]);
     setMessages([]);
     setMeetingState(MeetingState.LOBBY);
     setMeetingId(null);
     setHostId(null);
     setLocalUser(null);
-    setStreamReady(false); // Reset stream state so Lobby re-inits
+    setStreamReady(false);
     
-    // Reset Controls so user starts fresh in Lobby
     setIsMuted(false);
     setIsVideoOff(false);
     setIsScreenSharing(false);
     setIsBlurredBackground(false);
     
-    // 4. Reset URL without reloading page (Soft Navigation)
     const cleanUrl = window.location.pathname;
     try {
         window.history.pushState({}, '', cleanUrl);
     } catch (e) {
-        console.warn("Could not reset history state (likely blob/sandbox environment):", e);
+        console.warn("Could not reset history state:", e);
     }
     
-    // Re-init stream for lobby after leaving
     const initStream = async () => {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ 
@@ -510,12 +566,6 @@ const App: React.FC = () => {
             audio: true 
         });
         localStreamRef.current = stream;
-        
-        // Explicitly enable tracks since we reset controls to defaults (unmuted/video on)
-        // This handles cases where user left while muted/video-off
-        stream.getAudioTracks().forEach(track => track.enabled = true);
-        stream.getVideoTracks().forEach(track => track.enabled = true);
-        
         setStreamReady(true);
       } catch (err) {
         console.error("Error re-accessing media:", err);
@@ -524,8 +574,6 @@ const App: React.FC = () => {
     initStream();
   };
 
-  // --- Renders ---
-  
   const renderToast = () => {
       if (!toastMessage) return null;
       return (
@@ -540,7 +588,6 @@ const App: React.FC = () => {
       );
   };
 
-  // Construct a preview participant for the Lobby
   const previewParticipant: Participant = {
     id: 'preview',
     name: nameInput || 'You',
@@ -561,7 +608,6 @@ const App: React.FC = () => {
       <div className="h-screen w-full flex flex-col items-center justify-center bg-gray-950 text-white p-4 relative overflow-hidden">
          {renderToast()}
          
-         {/* Background Decoration */}
          <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-primary-900/10 via-gray-950 to-gray-950 -z-10"></div>
 
          <div className="w-full max-w-4xl grid md:grid-cols-2 gap-8 items-center z-10">
@@ -585,7 +631,7 @@ const App: React.FC = () => {
                             variant="secondary" 
                             size="icon" 
                             active={!isMuted} 
-                            onClick={() => setIsMuted(!isMuted)}
+                            onClick={toggleMic}
                             className={isMuted ? 'bg-red-500 hover:bg-red-600 border-none' : ''}
                             tooltip={isMuted ? "Unmute" : "Mute"}
                         >
@@ -595,7 +641,7 @@ const App: React.FC = () => {
                             variant="secondary" 
                             size="icon" 
                             active={!isVideoOff} 
-                            onClick={() => setIsVideoOff(!isVideoOff)}
+                            onClick={toggleCamera}
                             className={isVideoOff ? 'bg-red-500 hover:bg-red-600 border-none' : ''}
                             tooltip={isVideoOff ? "Turn Camera On" : "Turn Camera Off"}
                         >
@@ -673,8 +719,6 @@ const App: React.FC = () => {
   }
 
   // --- IN MEETING RENDER ---
-  
-  // Grid Calculation
   const total = participants.length;
   let gridClass = "grid-cols-1 md:grid-cols-2 lg:grid-cols-3";
   if (total === 1) gridClass = "grid-cols-1 max-w-4xl";
@@ -688,10 +732,7 @@ const App: React.FC = () => {
     <div className="h-screen w-full bg-gray-950 text-white flex flex-col overflow-hidden">
         {renderToast()}
         
-        {/* Main Content Area */}
         <div className="flex-1 flex overflow-hidden relative">
-            
-            {/* Video Grid */}
             <div className="flex-1 overflow-y-auto custom-scrollbar p-4 flex items-center justify-center">
                 <div className={`grid ${gridClass} gap-4 w-full max-w-[1800px] auto-rows-fr transition-all duration-500`}>
                     {participants.map((p) => (
@@ -709,7 +750,6 @@ const App: React.FC = () => {
                 </div>
             </div>
 
-            {/* Sidebar (Chat/Participants) */}
             {showChat && localUser && (
                 <ChatPanel 
                     messages={messages} 
@@ -720,9 +760,7 @@ const App: React.FC = () => {
             )}
         </div>
 
-        {/* Control Bar */}
         <div className="h-20 bg-gray-900 border-t border-gray-800 flex items-center justify-between px-6 z-30 shrink-0">
-            {/* Left Info */}
             <div className="hidden md:flex items-center gap-3">
                 <div className="flex flex-col">
                     <span className="font-bold text-sm">Real-Time Meeting</span>
@@ -732,7 +770,6 @@ const App: React.FC = () => {
                 </div>
             </div>
 
-            {/* Center Controls */}
             <div className="flex items-center gap-3">
                 <Button 
                     variant="secondary" 
@@ -772,7 +809,6 @@ const App: React.FC = () => {
                      <Button variant="secondary" size="icon">
                         <Smile size={20} />
                      </Button>
-                     {/* Reaction Popover */}
                      <div className="absolute bottom-full left-1/2 transform -translate-x-1/2 mb-4 bg-gray-800 rounded-full shadow-xl border border-gray-700 p-2 flex gap-1 invisible group-hover:visible transition-all opacity-0 group-hover:opacity-100">
                          {REACTIONS_LIST.map(emoji => (
                              <button 
@@ -820,7 +856,6 @@ const App: React.FC = () => {
                 </Button>
             </div>
 
-            {/* Right Controls */}
             <div className="hidden md:flex items-center gap-3">
                  <Button variant="ghost" size="icon">
                      <Settings size={20} />
