@@ -102,19 +102,8 @@ const App: React.FC = () => {
     return () => clearInterval(interval);
   }, []);
 
-  // Sync local controls to stream and participant state
+  // Sync local controls to participant state (Broadcasting)
   useEffect(() => {
-    // Only apply enabled/disabled logic if tracks are LIVE. 
-    // In Lobby, we might stop tracks completely.
-    if (localStreamRef.current) {
-        localStreamRef.current.getAudioTracks().forEach(t => {
-            if (t.readyState === 'live') t.enabled = !isMuted;
-        });
-        localStreamRef.current.getVideoTracks().forEach(t => {
-            if (t.readyState === 'live') t.enabled = !isVideoOff;
-        });
-    }
-
     if (meetingState === MeetingState.IN_MEETING && localUser) {
         // Update local participant state
         setParticipants(prev => prev.map(p => {
@@ -149,17 +138,16 @@ const App: React.FC = () => {
 
   // --- Handlers ---
 
-  // Enhanced Toggle Handlers for Lobby (Stop tracks completely)
+  // Enhanced Toggle Handlers (Stop tracks completely to release hardware)
   const toggleMic = async () => {
     const newMuted = !isMuted;
     setIsMuted(newMuted);
 
-    if (meetingState === MeetingState.LOBBY && localStreamRef.current) {
+    if (localStreamRef.current) {
         if (newMuted) {
-            // Stop tracks to release hardware in Lobby
+            // Stop tracks to release hardware
             localStreamRef.current.getAudioTracks().forEach(t => {
                 t.stop();
-                t.enabled = false;
             });
         } else {
             // Restart Mic
@@ -169,6 +157,16 @@ const App: React.FC = () => {
                 
                 localStreamRef.current.getAudioTracks().forEach(t => localStreamRef.current?.removeTrack(t));
                 localStreamRef.current.addTrack(newTrack);
+                
+                // If in meeting, replace track for all peers
+                if (meetingState === MeetingState.IN_MEETING) {
+                     Object.values(callsRef.current).forEach((call: any) => {
+                         const sender = call.peerConnection?.getSenders().find((s: any) => s.track?.kind === 'audio');
+                         if (sender) {
+                             sender.replaceTrack(newTrack).catch((e: any) => console.error("Replace Audio Track Error", e));
+                         }
+                     });
+                }
                 setStreamReady(prev => !prev); // Force refresh
             } catch (e) {
                 console.error("Mic restart failed", e);
@@ -183,12 +181,11 @@ const App: React.FC = () => {
     const newVideoOff = !isVideoOff;
     setIsVideoOff(newVideoOff);
 
-    if (meetingState === MeetingState.LOBBY && localStreamRef.current) {
+    if (localStreamRef.current) {
         if (newVideoOff) {
             // Stop tracks to turn off camera light
             localStreamRef.current.getVideoTracks().forEach(t => {
                 t.stop();
-                t.enabled = false;
             });
         } else {
             // Restart Camera
@@ -198,6 +195,16 @@ const App: React.FC = () => {
                 
                 localStreamRef.current.getVideoTracks().forEach(t => localStreamRef.current?.removeTrack(t));
                 localStreamRef.current.addTrack(newTrack);
+                
+                // If in meeting, replace track for all peers
+                if (meetingState === MeetingState.IN_MEETING) {
+                     Object.values(callsRef.current).forEach((call: any) => {
+                         const sender = call.peerConnection?.getSenders().find((s: any) => s.track?.kind === 'video');
+                         if (sender) {
+                             sender.replaceTrack(newTrack).catch((e: any) => console.error("Replace Video Track Error", e));
+                         }
+                     });
+                }
                 setStreamReady(prev => !prev); // Force refresh
             } catch (e) {
                 console.error("Camera restart failed", e);
@@ -408,10 +415,7 @@ const App: React.FC = () => {
     const trimmedName = nameInput.trim();
     localStorage.setItem('connect_meet_username', trimmedName);
 
-    // CRITICAL: Ensure we have live tracks before joining.
-    // If user muted/turned off camera in lobby, tracks might be stopped.
-    // We must restart them to have valid MediaStream for WebRTC negotiation, 
-    // even if we immediately set enabled=false.
+    // Ensure we have streams before joining
     if (localStreamRef.current) {
          const videoTrack = localStreamRef.current.getVideoTracks()[0];
          const audioTrack = localStreamRef.current.getAudioTracks()[0];
@@ -428,11 +432,7 @@ const App: React.FC = () => {
                 });
                 // Clean up old
                 localStreamRef.current.getTracks().forEach(t => t.stop());
-                
                 localStreamRef.current = newStream;
-                // Apply current mute state
-                newStream.getAudioTracks().forEach(t => t.enabled = !isMuted);
-                newStream.getVideoTracks().forEach(t => t.enabled = !isVideoOff);
                 setStreamReady(true);
              } catch (err) {
                  setToastMessage("Failed to initialize media");
@@ -441,6 +441,16 @@ const App: React.FC = () => {
          }
     } else {
         await startMediaStream();
+    }
+    
+    // Apply initial mute states by stopping tracks if necessary
+    if (localStreamRef.current) {
+        if (isMuted) {
+            localStreamRef.current.getAudioTracks().forEach(t => t.stop());
+        }
+        if (isVideoOff) {
+            localStreamRef.current.getVideoTracks().forEach(t => t.stop());
+        }
     }
 
     const newUser: User = {
@@ -775,7 +785,7 @@ const App: React.FC = () => {
                     variant="secondary" 
                     size="icon" 
                     active={!isMuted} 
-                    onClick={() => setIsMuted(!isMuted)}
+                    onClick={toggleMic}
                     className={isMuted ? 'bg-red-600 hover:bg-red-700' : ''}
                     tooltip="Toggle Microphone"
                 >
@@ -786,7 +796,7 @@ const App: React.FC = () => {
                     variant="secondary" 
                     size="icon" 
                     active={!isVideoOff} 
-                    onClick={() => setIsVideoOff(!isVideoOff)}
+                    onClick={toggleCamera}
                     className={isVideoOff ? 'bg-red-600 hover:bg-red-700' : ''}
                     tooltip="Toggle Camera"
                 >
