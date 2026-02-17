@@ -35,6 +35,7 @@ const App: React.FC = () => {
   const [isScreenSharing, setIsScreenSharing] = useState(false);
   const [isBlurredBackground, setIsBlurredBackground] = useState(false);
   const [showChat, setShowChat] = useState(false);
+  const [streamReady, setStreamReady] = useState(false); // To trigger render when stream is acquired
   
   // UI Feedback State
   const [toastMessage, setToastMessage] = useState<string | null>(null);
@@ -55,33 +56,35 @@ const App: React.FC = () => {
     }
   }, []);
 
-  // Initialize Media Stream in Lobby
-  useEffect(() => {
-    const initStream = async () => {
+  // Helper to start media stream
+  const startMediaStream = useCallback(async () => {
       try {
+        if (localStreamRef.current) {
+            localStreamRef.current.getTracks().forEach(track => track.stop());
+        }
+        
+        setStreamReady(false);
         const stream = await navigator.mediaDevices.getUserMedia({ 
             video: { width: 640, height: 480 }, 
             audio: true 
         });
         localStreamRef.current = stream;
         
-        // Initial mute/video state application
-        stream.getAudioTracks().forEach(track => track.enabled = !isMuted);
-        stream.getVideoTracks().forEach(track => track.enabled = !isVideoOff);
+        // We do not set track enabled state here manually.
+        // We rely on the sync effect below which triggers on streamReady change.
         
-        // Trigger re-render to show video in lobby
-        // We do this by updating localUser if it exists, or just force update via state
-        if (localUser) {
-           // This effect primarily ensures stream is ready. 
-           // The video tile reads from localStreamRef via prop or hook in real implementations, 
-           // but here we will pass it into the participant object in the join handler.
-        }
+        setStreamReady(true);
+        setToastMessage(null);
       } catch (err) {
         console.error("Error accessing media devices:", err);
         setToastMessage("Could not access camera/microphone");
+        setStreamReady(false);
       }
-    };
-    initStream();
+  }, []);
+
+  // Initialize Media Stream in Lobby
+  useEffect(() => {
+    startMediaStream();
     
     return () => {
         // Cleanup stream on unmount
@@ -89,7 +92,7 @@ const App: React.FC = () => {
             localStreamRef.current.getTracks().forEach(track => track.stop());
         }
     };
-  }, []); // Run once on mount
+  }, [startMediaStream]); // Run once on mount (startMediaStream is stable)
 
   // Cleanup reactions automatically
   useEffect(() => {
@@ -129,12 +132,12 @@ const App: React.FC = () => {
             }
         });
     }
-  }, [isMuted, isVideoOff, isScreenSharing, isBlurredBackground, localUser, meetingState]);
+  }, [isMuted, isVideoOff, isScreenSharing, isBlurredBackground, localUser, meetingState, streamReady]);
 
 
   // --- Helper: Broadcast Data ---
   const broadcastData = (data: any) => {
-      Object.values(connectionsRef.current).forEach(conn => {
+      Object.values(connectionsRef.current).forEach((conn: DataConnection) => {
           if (conn.open) {
               conn.send(data);
           }
@@ -143,35 +146,7 @@ const App: React.FC = () => {
 
   // --- Handlers ---
 
-  const handleContinue = (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    if (!nameInput.trim()) return;
-
-    const trimmedName = nameInput.trim();
-    localStorage.setItem('connect_meet_username', trimmedName);
-
-    // If no meeting ID in URL, generate one (which will be our Peer ID)
-    // If meeting ID exists, we will connect to it
-    const isHost = !hostId;
-    
-    // NOTE: In this simplified PeerJS flow, we don't know our Peer ID until we init PeerJS.
-    // So we create the user object first, but the ID will be updated or linked to Peer ID.
-    // For simplicity, we will let PeerJS assign the ID, and we use that as User ID.
-    
-    const tempUser: User = {
-      id: 'temp', // Will update
-      name: trimmedName,
-      avatarUrl: `https://ui-avatars.com/api/?name=${encodeURIComponent(trimmedName)}&background=2563eb&color=fff`,
-      isHost: isHost
-    };
-
-    setLocalUser(tempUser);
-    setMeetingState(MeetingState.LOBBY);
-  };
-
-  const initializePeer = async () => {
-      if (!localUser) return;
-
+  const initializePeer = async (user: User) => {
       // Import PeerJS dynamically if needed or assume it's global/imported
       // const { default: Peer } = await import('peerjs');
       
@@ -185,16 +160,20 @@ const App: React.FC = () => {
               setMeetingId(id);
               // Update URL without reload
               const newUrl = `${window.location.pathname}?meet=${id}`;
-              window.history.pushState({ path: newUrl }, '', newUrl);
+              try {
+                  window.history.pushState({ path: newUrl }, '', newUrl);
+              } catch (e) {
+                  console.warn("Could not push history state (likely blob/sandbox environment):", e);
+              }
           }
 
           // Update local user ID to match Peer ID for consistency
-          setLocalUser(prev => prev ? { ...prev, id: id } : null);
+          setLocalUser(prev => prev ? { ...prev, id: id } : { ...user, id: id });
           peerRef.current = peer;
 
           // If I am a guest, connect to the host immediately
           if (hostId) {
-             connectToHost(hostId, peer, id);
+             connectToHost(hostId, peer, id, user);
           }
       });
 
@@ -217,12 +196,12 @@ const App: React.FC = () => {
       });
   };
 
-  const connectToHost = (hostPeerId: string, peer: Peer, myId: string) => {
+  const connectToHost = (hostPeerId: string, peer: Peer, myId: string, user: User) => {
       // 1. Data Connection (for chat, state sync)
       const conn = peer.connect(hostPeerId, {
-          metadata: { name: localUser?.name, avatarUrl: localUser?.avatarUrl }
+          metadata: { name: user.name, avatarUrl: user.avatarUrl }
       });
-      handleDataConnection(conn);
+      handleDataConnection(conn, user);
 
       // 2. Media Connection
       if (localStreamRef.current) {
@@ -231,19 +210,23 @@ const App: React.FC = () => {
       }
   };
 
-  const handleDataConnection = (conn: DataConnection) => {
+  const handleDataConnection = (conn: DataConnection, userContext?: User) => {
       connectionsRef.current[conn.peer] = conn;
 
       conn.on('open', () => {
           console.log('Data connection open with:', conn.peer);
           // Send my details
-          if (localUser) {
+          // We need current localUser, but inside callback it might be stale if we don't use ref or pass it.
+          // If called during init, use passed userContext. If called later (host receiving guest), use localUser state (which should be set).
+          const userToSend = userContext || localUser;
+
+          if (userToSend) {
               conn.send({
                   type: 'USER_INFO',
                   payload: {
                       id: peerRef.current?.id,
-                      name: localUser.name,
-                      avatarUrl: localUser.avatarUrl,
+                      name: userToSend.name,
+                      avatarUrl: userToSend.avatarUrl,
                       isMuted,
                       isVideoOff
                   }
@@ -381,17 +364,28 @@ const App: React.FC = () => {
       }));
   };
 
-  const handleJoinMeeting = () => {
-    initializePeer();
+  const handleJoinMeeting = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!nameInput.trim()) return;
+
+    const trimmedName = nameInput.trim();
+    localStorage.setItem('connect_meet_username', trimmedName);
+
+    // Create User Object
+    const newUser: User = {
+        id: 'temp-init', // PeerJS will assign real ID
+        name: trimmedName,
+        avatarUrl: `https://ui-avatars.com/api/?name=${encodeURIComponent(trimmedName)}&background=2563eb&color=fff`,
+        isHost: !hostId
+    };
+
+    setLocalUser(newUser);
+    initializePeer(newUser);
     
-    // Set initial local participant
-    if (localUser && localStreamRef.current) {
+    // Set initial local participant for the grid
+    if (localStreamRef.current) {
         setParticipants([{
-            ...localUser,
-            // ID might still be 'temp' here until peer opens, but that's okay, 
-            // the peer.on('open') will update localUser state, 
-            // and we will update participant list then or via effect.
-            // Actually, let's wait for peer open to finalize this, but for UI feedback:
+            ...newUser,
             id: 'local-temp', 
             stream: localStreamRef.current,
             isMuted,
@@ -409,9 +403,9 @@ const App: React.FC = () => {
 
   // Update local participant ID in the list once Peer is ready
   useEffect(() => {
-      if (meetingState === MeetingState.IN_MEETING && localUser?.id !== 'temp') {
+      if (meetingState === MeetingState.IN_MEETING && localUser?.id && localUser.id !== 'temp-init') {
           setParticipants(prev => prev.map(p => {
-              if (p.id === 'local-temp' || p.id === 'temp') {
+              if (p.id === 'local-temp' || p.id === 'temp-init') {
                   return { ...p, id: localUser!.id, name: localUser!.name };
               }
               return p;
@@ -472,6 +466,64 @@ const App: React.FC = () => {
     });
   };
 
+  const handleLeaveMeeting = () => {
+    // 1. Cleanup WebRTC connections
+    if (peerRef.current) {
+        peerRef.current.destroy();
+        peerRef.current = null;
+    }
+    
+    // 2. Stop Camera/Mic tracks
+    if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach(track => track.stop());
+        localStreamRef.current = null;
+    }
+
+    // 3. Reset all state variables
+    setParticipants([]);
+    setMessages([]);
+    setMeetingState(MeetingState.LOBBY);
+    setMeetingId(null);
+    setHostId(null);
+    setLocalUser(null);
+    setStreamReady(false); // Reset stream state so Lobby re-inits
+    
+    // Reset Controls so user starts fresh in Lobby
+    setIsMuted(false);
+    setIsVideoOff(false);
+    setIsScreenSharing(false);
+    setIsBlurredBackground(false);
+    
+    // 4. Reset URL without reloading page (Soft Navigation)
+    const cleanUrl = window.location.pathname;
+    try {
+        window.history.pushState({}, '', cleanUrl);
+    } catch (e) {
+        console.warn("Could not reset history state (likely blob/sandbox environment):", e);
+    }
+    
+    // Re-init stream for lobby after leaving
+    const initStream = async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+            video: { width: 640, height: 480 }, 
+            audio: true 
+        });
+        localStreamRef.current = stream;
+        
+        // Explicitly enable tracks since we reset controls to defaults (unmuted/video on)
+        // This handles cases where user left while muted/video-off
+        stream.getAudioTracks().forEach(track => track.enabled = true);
+        stream.getVideoTracks().forEach(track => track.enabled = true);
+        
+        setStreamReady(true);
+      } catch (err) {
+        console.error("Error re-accessing media:", err);
+      }
+    };
+    initStream();
+  };
+
   // --- Renders ---
   
   const renderToast = () => {
@@ -488,94 +540,43 @@ const App: React.FC = () => {
       );
   };
 
-  if (!localUser) {
-    return (
-      <div className="h-screen w-full flex items-center justify-center bg-gray-950 relative overflow-hidden">
-        {renderToast()}
-        {/* Animated Background */}
-        <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-primary-900/20 via-gray-950 to-gray-950"></div>
-        <div className="absolute top-0 left-0 w-full h-full overflow-hidden opacity-30">
-            <div className="absolute top-[20%] left-[20%] w-72 h-72 bg-purple-600 rounded-full mix-blend-multiply filter blur-xl animate-pulse-slow"></div>
-            <div className="absolute top-[20%] right-[20%] w-72 h-72 bg-blue-600 rounded-full mix-blend-multiply filter blur-xl animate-pulse-slow animation-delay-2000"></div>
-        </div>
-
-        <div className="z-10 bg-gray-900/80 backdrop-blur-xl p-8 rounded-2xl border border-gray-700 shadow-2xl max-w-md w-full">
-          <div className="text-center mb-8">
-            <div className="flex justify-center mb-6">
-               <div className="w-16 h-16 bg-gradient-to-br from-primary-500 to-purple-600 rounded-xl flex items-center justify-center text-white shadow-lg">
-                  <Video size={32} />
-               </div>
-            </div>
-            <h1 className="text-3xl font-bold text-white mb-2">{APP_NAME}</h1>
-            <p className="text-gray-400">
-                {hostId ? 'Join the meeting with your name.' : 'Start a new meeting instantly.'}
-            </p>
-          </div>
-          
-          <form onSubmit={handleContinue} className="space-y-4">
-             <div>
-                <label htmlFor="name" className="block text-xs font-medium text-gray-400 mb-1 ml-1">DISPLAY NAME</label>
-                <div className="relative">
-                    <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-gray-500">
-                        <UserIcon size={18} />
-                    </div>
-                    <input 
-                        type="text" 
-                        id="name"
-                        value={nameInput}
-                        onChange={(e) => setNameInput(e.target.value)}
-                        placeholder="Enter your full name"
-                        className="w-full bg-gray-950 border border-gray-700 text-white rounded-lg py-3 pl-10 pr-4 focus:ring-2 focus:ring-primary-500 focus:border-transparent outline-none transition-all placeholder-gray-600"
-                        autoFocus
-                    />
-                </div>
-             </div>
-
-             <Button 
-                type="submit"
-                disabled={!nameInput.trim()}
-                className="w-full py-3 text-base flex items-center justify-center gap-2 group"
-             >
-                Continue
-                <ArrowRight size={18} className="group-hover:translate-x-1 transition-transform" />
-             </Button>
-          </form>
-
-          <p className="mt-6 text-xs text-gray-500 text-center">
-             Using secure peer-to-peer connection.
-          </p>
-        </div>
-      </div>
-    );
-  }
+  // Construct a preview participant for the Lobby
+  const previewParticipant: Participant = {
+    id: 'preview',
+    name: nameInput || 'You',
+    avatarUrl: `https://ui-avatars.com/api/?name=${encodeURIComponent(nameInput || 'You')}&background=2563eb&color=fff`,
+    isHost: false,
+    isMuted,
+    isVideoOff,
+    isScreenSharing: false,
+    isBlurredBackground,
+    isSpeaking: false,
+    connectionQuality: ConnectionQuality.EXCELLENT,
+    reactions: [],
+    stream: localStreamRef.current || undefined
+  };
 
   if (meetingState === MeetingState.LOBBY) {
     return (
-      <div className="h-screen w-full flex flex-col items-center justify-center bg-gray-950 text-white p-4">
+      <div className="h-screen w-full flex flex-col items-center justify-center bg-gray-950 text-white p-4 relative overflow-hidden">
          {renderToast()}
-         <div className="w-full max-w-4xl grid md:grid-cols-2 gap-8 items-center">
-            {/* Preview */}
+         
+         {/* Background Decoration */}
+         <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-primary-900/10 via-gray-950 to-gray-950 -z-10"></div>
+
+         <div className="w-full max-w-4xl grid md:grid-cols-2 gap-8 items-center z-10">
+            {/* Preview Section */}
             <div className="space-y-4">
                 <div className="aspect-video bg-gray-800 rounded-2xl overflow-hidden relative shadow-2xl border border-gray-700">
                     {isVideoOff ? (
                          <div className="w-full h-full flex items-center justify-center bg-gray-900">
                             <div className="w-32 h-32 rounded-full overflow-hidden border-4 border-gray-700">
-                                <img src={localUser.avatarUrl} alt="Me" referrerPolicy="no-referrer" />
+                                <img src={previewParticipant.avatarUrl} alt="Me" referrerPolicy="no-referrer" />
                             </div>
                          </div>
                     ) : (
                         <VideoTile 
-                            participant={{
-                                ...localUser, 
-                                isMuted, 
-                                isVideoOff, 
-                                isScreenSharing: false, 
-                                isBlurredBackground, 
-                                isSpeaking: false, 
-                                connectionQuality: ConnectionQuality.EXCELLENT, 
-                                reactions: [],
-                                stream: localStreamRef.current || undefined
-                            }} 
+                            participant={previewParticipant} 
                             isLocal 
                         />
                     )}
@@ -612,33 +613,59 @@ const App: React.FC = () => {
                          </Button>
                     </div>
                 </div>
+                <div className="text-center text-sm text-gray-500">
+                    Check your audio and video before joining.
+                </div>
             </div>
 
-            {/* Join Controls */}
-            <div className="space-y-6">
+            {/* Join Controls Section */}
+            <div className="bg-gray-900/50 backdrop-blur-md p-8 rounded-2xl border border-gray-800 shadow-xl space-y-6">
                 <div>
-                    <h2 className="text-3xl font-bold mb-2">Ready to join, {localUser.name.split(' ')[0]}?</h2>
-                    
-                    {/* Only show Link Copy if we are already Host (or have an ID). 
-                        Actually, ID isn't generated until we click Join (Peer Init).
-                        So we hide the link here until inside, or we can't show it yet.
-                    */}
-                    {hostId && (
-                        <div className="bg-gray-800/50 rounded-lg p-3 border border-gray-700 mt-4 flex items-center justify-between">
+                    <h2 className="text-3xl font-bold mb-2 text-white">{APP_NAME}</h2>
+                    <p className="text-gray-400">
+                        {hostId ? 'You are joining a meeting.' : 'Start a new high-quality video meeting.'}
+                    </p>
+                </div>
+                
+                <form onSubmit={handleJoinMeeting} className="space-y-4">
+                     <div>
+                        <label htmlFor="name" className="block text-xs font-medium text-gray-400 mb-1 ml-1">DISPLAY NAME</label>
+                        <div className="relative">
+                            <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-gray-500">
+                                <UserIcon size={18} />
+                            </div>
+                            <input 
+                                type="text" 
+                                id="name"
+                                value={nameInput}
+                                onChange={(e) => setNameInput(e.target.value)}
+                                placeholder="Enter your full name"
+                                className="w-full bg-gray-950 border border-gray-700 text-white rounded-lg py-3 pl-10 pr-4 focus:ring-2 focus:ring-primary-500 focus:border-transparent outline-none transition-all placeholder-gray-600"
+                                autoFocus
+                            />
+                        </div>
+                     </div>
+                     
+                     {hostId && (
+                        <div className="bg-gray-800/50 rounded-lg p-3 border border-gray-700 flex items-center justify-between">
                             <div className="overflow-hidden mr-4">
-                                <p className="text-xs text-gray-400 mb-0.5 uppercase tracking-wider font-semibold">Joining Meeting</p>
+                                <p className="text-xs text-gray-400 mb-0.5 uppercase tracking-wider font-semibold">Meeting Code</p>
                                 <p className="text-sm font-mono text-blue-400 truncate">
                                     {hostId}
                                 </p>
                             </div>
                         </div>
                     )}
-                </div>
-                <div className="flex flex-col gap-3">
-                    <Button size="lg" onClick={handleJoinMeeting} className="w-full shadow-lg shadow-primary-900/50">
-                        {hostId ? 'Join Meeting' : 'Start Meeting'}
+
+                    <Button 
+                        type="submit"
+                        disabled={!nameInput.trim()}
+                        className="w-full py-3 text-base flex items-center justify-center gap-2 group shadow-lg shadow-primary-900/20"
+                    >
+                        {hostId ? 'Join Meeting' : 'Start New Meeting'}
+                        <ArrowRight size={18} className="group-hover:translate-x-1 transition-transform" />
                     </Button>
-                </div>
+                </form>
             </div>
          </div>
       </div>
@@ -786,10 +813,7 @@ const App: React.FC = () => {
                 <Button 
                     variant="danger" 
                     className="px-6 rounded-full"
-                    onClick={() => {
-                        peerRef.current?.destroy();
-                        window.location.href = window.location.origin + window.location.pathname; // Reload to clear
-                    }}
+                    onClick={handleLeaveMeeting}
                 >
                     <PhoneOff size={20} className="mr-2" />
                     Leave

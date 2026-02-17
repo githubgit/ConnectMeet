@@ -32,10 +32,15 @@ export const VideoTile: React.FC<VideoTileProps> = ({ participant, isLocal = fal
   // Handle stream attachment for both Local and Remote
   useEffect(() => {
     const videoEl = videoRef.current;
-    if (videoEl && participant.stream) {
-        // Only update if different to prevent flickering
-        if (videoEl.srcObject !== participant.stream) {
-            videoEl.srcObject = participant.stream;
+    if (videoEl) {
+        if (participant.stream) {
+            // Only update if different to prevent flickering
+            if (videoEl.srcObject !== participant.stream) {
+                videoEl.srcObject = participant.stream;
+            }
+        } else {
+            // Ensure we clear the source if stream is gone (e.g. leaving meeting)
+            videoEl.srcObject = null;
         }
     }
   }, [participant.stream]);
