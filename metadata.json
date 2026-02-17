@@ -1,0 +1,8 @@
+{
+  "name": "Connect Meet",
+  "description": "A high-performance video conferencing application featuring real-time chat, AI-powered meeting assistance, and interactive reactions.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
