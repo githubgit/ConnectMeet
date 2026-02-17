@@ -10,7 +10,7 @@ import { ChatPanel } from './components/ChatPanel';
 import { 
   Mic, MicOff, Video, VideoOff, PhoneOff, 
   MessageSquare, Users, MoreVertical, Settings, 
-  Share, Smile, MonitorUp, Copy, Link, Check, User as UserIcon, ArrowRight, Aperture, Image as ImageIcon
+  Share, Smile, MonitorUp, Copy, Link, Check, User as UserIcon, ArrowRight, Aperture, Image as ImageIcon, Hash, AlertTriangle, ExternalLink, RefreshCw
 } from 'lucide-react';
 
 const App: React.FC = () => {
@@ -29,6 +29,7 @@ const App: React.FC = () => {
   // Login Input State
   const [nameInput, setNameInput] = useState('');
   const [avatarInput, setAvatarInput] = useState('');
+  const [joinCodeInput, setJoinCodeInput] = useState('');
 
   // Controls State
   const [isMuted, setIsMuted] = useState(false);
@@ -37,9 +38,13 @@ const App: React.FC = () => {
   const [isBlurredBackground, setIsBlurredBackground] = useState(false);
   const [showChat, setShowChat] = useState(false);
   const [streamReady, setStreamReady] = useState(false); // To trigger render when stream is acquired
+  const [peerConnected, setPeerConnected] = useState(false);
   
   // UI Feedback State
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  // Environment Check
+  const isPreviewEnv = window.location.protocol === 'blob:';
 
   // --- Refs for WebRTC ---
   const peerRef = useRef<Peer | null>(null);
@@ -251,27 +256,58 @@ const App: React.FC = () => {
     }
   };
 
-  const initializePeer = async (user: User) => {
-      const peer = new Peer(hostId ? undefined : undefined); 
+  const initializePeer = async (user: User, overrideHostId?: string | null) => {
+      // Clean up previous peer if exists
+      if (peerRef.current) {
+          peerRef.current.destroy();
+      }
+
+      setPeerConnected(false);
+      const targetHostId = overrideHostId !== undefined ? overrideHostId : hostId;
+      
+      const peer = new Peer({
+          config: {
+              iceServers: [
+                  { urls: 'stun:stun.l.google.com:19302' },
+                  { urls: 'stun:stun1.l.google.com:19302' },
+              ]
+          },
+          debug: 1
+      });
 
       peer.on('open', (id) => {
           console.log('My peer ID is: ' + id);
+          setPeerConnected(true);
           
-          if (!hostId) {
+          if (!targetHostId) {
               setMeetingId(id);
-              const newUrl = `${window.location.pathname}?meet=${id}`;
-              try {
-                  window.history.pushState({ path: newUrl }, '', newUrl);
-              } catch (e) {
-                  console.warn("History push failed:", e);
+              
+              if (!isPreviewEnv) {
+                  try {
+                      const currentUrl = new URL(window.location.href);
+                      currentUrl.searchParams.set('meet', id);
+                      const newUrl = currentUrl.toString();
+                      window.history.pushState({ path: newUrl }, '', newUrl);
+                  } catch (e) {
+                      console.warn("History push failed:", e);
+                  }
               }
           }
 
           setLocalUser(prev => prev ? { ...prev, id: id } : { ...user, id: id });
           peerRef.current = peer;
 
-          if (hostId) {
-             connectToHost(hostId, peer, id, user);
+          if (targetHostId) {
+             connectToHost(targetHostId, peer, id, user);
+          }
+      });
+
+      peer.on('disconnected', () => {
+          console.log('Peer disconnected from server.');
+          setPeerConnected(false);
+          // Auto-reconnect
+          if (peer && !peer.destroyed) {
+              peer.reconnect();
           }
       });
 
@@ -286,9 +322,16 @@ const App: React.FC = () => {
           }
       });
 
-      peer.on('error', (err) => {
+      peer.on('error', (err: any) => {
           console.error('Peer error:', err);
-          setToastMessage(`Connection Error: ${err.type}`);
+          setPeerConnected(false);
+          let msg = `Connection Error: ${err.type}`;
+          if (err.type === 'peer-unavailable') {
+              msg = "Meeting ID not found. Check the code.";
+          } else if (err.type === 'network') {
+              msg = "Lost connection to server.";
+          }
+          setToastMessage(msg);
       });
   };
 
@@ -480,16 +523,20 @@ const App: React.FC = () => {
     const trimmedName = nameInput.trim();
     localStorage.setItem('connect_meet_username', trimmedName);
     
+    // Logic to handle joinCodeInput if hostId is missing
+    let targetHostId = hostId;
+    if (!targetHostId && joinCodeInput.trim()) {
+        targetHostId = joinCodeInput.trim();
+        setHostId(targetHostId);
+    }
+
     // Ensure we have streams before joining
     // If streams are stopped (because video/mic was toggled off), we might need to refresh them to ensure we have a valid stream object to pass, even if tracks are stopped.
-    // Actually, we just need to make sure localStreamRef.current exists.
     if (!localStreamRef.current) {
         await startMediaStream();
     }
     
-    // Apply initial mute states by stopping tracks if necessary. 
-    // If they were already stopped in Lobby, this is redundant but safe.
-    // If they were active (e.g. from startMediaStream above), this stops them.
+    // Apply initial mute states by stopping tracks if necessary.
     if (localStreamRef.current) {
         if (isMuted) {
             localStreamRef.current.getAudioTracks().forEach(t => t.stop());
@@ -505,11 +552,12 @@ const App: React.FC = () => {
         id: 'temp-init', 
         name: trimmedName,
         avatarUrl: finalAvatarUrl,
-        isHost: !hostId
+        isHost: !targetHostId
     };
 
     setLocalUser(newUser);
-    initializePeer(newUser);
+    // Pass the targetHostId explicitly to ensure peer connection logic uses the correct ID
+    initializePeer(newUser, targetHostId);
     
     if (localStreamRef.current) {
         setParticipants([{
@@ -578,14 +626,38 @@ const App: React.FC = () => {
   
   const handleCopyLink = () => {
     const idToShare = meetingId || hostId; 
-    const link = `${window.location.origin}${window.location.pathname}?meet=${idToShare}`;
-    navigator.clipboard.writeText(link).then(() => {
-        setToastMessage("Meeting link copied to clipboard");
-        setTimeout(() => setToastMessage(null), 3000);
-    }).catch(() => {
-        setToastMessage("Failed to copy link");
-        setTimeout(() => setToastMessage(null), 3000);
-    });
+    if (!idToShare) return;
+
+    if (isPreviewEnv) {
+        // In preview/blob environments, we can't generate a valid sharing link.
+        // We strictly copy the ID and inform the user.
+        navigator.clipboard.writeText(idToShare).then(() => {
+            setToastMessage("Meeting Code copied! (Preview Mode)");
+            setTimeout(() => setToastMessage(null), 3000);
+        }).catch(() => {
+            setToastMessage("Failed to copy code");
+            setTimeout(() => setToastMessage(null), 3000);
+        });
+    } else {
+        // Standard production link generation
+        const url = new URL(window.location.href);
+        url.searchParams.set('meet', idToShare);
+        const link = url.toString();
+
+        navigator.clipboard.writeText(link).then(() => {
+            setToastMessage("Meeting link copied to clipboard");
+            setTimeout(() => setToastMessage(null), 3000);
+        }).catch(() => {
+            setToastMessage("Failed to copy link");
+            setTimeout(() => setToastMessage(null), 3000);
+        });
+    }
+  };
+  
+  const handleManualReconnect = () => {
+      if (localUser) {
+          initializePeer(localUser);
+      }
   };
 
   const handleLeaveMeeting = () => {
@@ -604,17 +676,24 @@ const App: React.FC = () => {
     setHostId(null);
     setLocalUser(null);
     setStreamReady(false);
+    setJoinCodeInput('');
+    setPeerConnected(false);
     
     setIsMuted(false);
     setIsVideoOff(false);
     setIsScreenSharing(false);
     setIsBlurredBackground(false);
     
-    const cleanUrl = window.location.pathname;
-    try {
-        window.history.pushState({}, '', cleanUrl);
-    } catch (e) {
-        console.warn("Could not reset history state:", e);
+    // Robust URL cleanup
+    if (!isPreviewEnv) {
+        try {
+            const url = new URL(window.location.href);
+            url.searchParams.delete('meet');
+            const cleanUrl = url.toString();
+            window.history.pushState({}, '', cleanUrl);
+        } catch (e) {
+            console.warn("Could not reset history state:", e);
+        }
     }
     
     const initStream = async () => {
@@ -654,7 +733,7 @@ const App: React.FC = () => {
     isMuted,
     isVideoOff,
     isScreenSharing: false,
-    isBlurredBackground,
+    isBlurredBackground: false,
     isSpeaking: false,
     connectionQuality: ConnectionQuality.EXCELLENT,
     reactions: [],
@@ -735,6 +814,20 @@ const App: React.FC = () => {
                 <div className="text-center text-sm text-gray-500">
                     Check your audio and video before joining.
                 </div>
+                
+                {isPreviewEnv && (
+                    <div className="bg-yellow-900/30 border border-yellow-700/50 rounded-lg p-3 flex gap-3 items-start">
+                        <AlertTriangle className="text-yellow-500 shrink-0 mt-0.5" size={16} />
+                        <div className="text-left">
+                            <h4 className="text-yellow-500 font-semibold text-xs mb-1">Preview Mode Detected</h4>
+                            <p className="text-gray-400 text-xs leading-relaxed">
+                                You are viewing this app in a sandboxed preview URL (blob:). You cannot share this link with others. 
+                                <br/><br/>
+                                To test with other devices or browsers, please look for an <span className="text-white font-medium inline-flex items-center gap-1">Open in New Window <ExternalLink size={10}/></span> button (usually at the top-right of this preview pane) to get a shareable URL.
+                            </p>
+                        </div>
+                    </div>
+                )}
             </div>
 
             {/* Join Controls Section */}
@@ -765,7 +858,25 @@ const App: React.FC = () => {
                         </div>
                      </div>
                      
-                     {/* Avatar URL input removed as requested */}
+                     {/* Manual Join Code Input - Displayed if not already joining a specific meeting */}
+                     {!hostId && (
+                         <div>
+                            <label htmlFor="joinCode" className="block text-xs font-medium text-gray-400 mb-1 ml-1">MEETING CODE (OPTIONAL)</label>
+                            <div className="relative">
+                                <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-gray-500">
+                                    <Hash size={18} />
+                                </div>
+                                <input 
+                                    type="text" 
+                                    id="joinCode"
+                                    value={joinCodeInput}
+                                    onChange={(e) => setJoinCodeInput(e.target.value)}
+                                    placeholder="Enter code to join existing"
+                                    className="w-full bg-gray-950 border border-gray-700 text-white rounded-lg py-3 pl-10 pr-4 focus:ring-2 focus:ring-primary-500 focus:border-transparent outline-none transition-all placeholder-gray-600"
+                                />
+                            </div>
+                         </div>
+                     )}
                      
                      {hostId && (
                         <div className="bg-gray-800/50 rounded-lg p-3 border border-gray-700 flex items-center justify-between">
@@ -783,7 +894,7 @@ const App: React.FC = () => {
                         disabled={!nameInput.trim()}
                         className="w-full py-3 text-base flex items-center justify-center gap-2 group shadow-lg shadow-primary-900/20"
                     >
-                        {hostId ? 'Join Meeting' : 'Start New Meeting'}
+                        {hostId ? 'Join Meeting' : (joinCodeInput.trim() ? 'Join Existing' : 'Start New Meeting')}
                         <ArrowRight size={18} className="group-hover:translate-x-1 transition-transform" />
                     </Button>
                 </form>
@@ -818,8 +929,18 @@ const App: React.FC = () => {
                         />
                     ))}
                     {participants.length === 0 && (
-                        <div className="col-span-full flex items-center justify-center h-full text-gray-500">
-                            Connecting...
+                        <div className="col-span-full flex flex-col items-center justify-center h-full text-gray-500 space-y-4">
+                            <span>Connecting...</span>
+                            {!peerConnected && (
+                                <Button 
+                                    variant="secondary" 
+                                    size="sm" 
+                                    onClick={handleManualReconnect}
+                                    className="gap-2"
+                                >
+                                    <RefreshCw size={14} /> Retry Connection
+                                </Button>
+                            )}
                         </div>
                     )}
                 </div>
@@ -839,9 +960,16 @@ const App: React.FC = () => {
             <div className="hidden md:flex items-center gap-3">
                 <div className="flex flex-col">
                     <span className="font-bold text-sm">Real-Time Meeting</span>
-                    <span className="text-xs text-gray-400 flex items-center gap-1 cursor-pointer hover:text-white transition-colors" onClick={handleCopyLink}>
-                        {(meetingId || hostId) ? 'Copy Join Link' : 'Generating Link...'} <Copy size={10} />
-                    </span>
+                    <div className="flex items-center gap-2">
+                        {(meetingId || hostId) && (
+                            <span className="text-xs text-gray-400 bg-gray-800 px-2 py-0.5 rounded font-mono select-all">
+                                ID: {meetingId || hostId}
+                            </span>
+                        )}
+                        <span className="text-xs text-gray-400 flex items-center gap-1 cursor-pointer hover:text-white transition-colors" onClick={handleCopyLink}>
+                            {(meetingId || hostId) ? (isPreviewEnv ? 'Copy Code' : 'Copy Link') : 'Generating...'} <Copy size={10} />
+                        </span>
+                    </div>
                 </div>
             </div>
 
@@ -884,7 +1012,7 @@ const App: React.FC = () => {
                     variant="secondary"
                     size="icon"
                     onClick={handleCopyLink}
-                    tooltip="Copy Invite Link"
+                    tooltip={isPreviewEnv ? "Copy Meeting Code" : "Copy Invite Link"}
                 >
                     <Share size={20} />
                 </Button>
