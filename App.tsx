@@ -621,7 +621,7 @@ const App: React.FC = () => {
     const finalAvatarUrl = avatarInput.trim() || `https://ui-avatars.com/api/?name=${encodeURIComponent(trimmedName)}&background=2563eb&color=fff`;
 
     const newUser: User = {
-        id: 'temp-init', 
+        id: 'local-temp', // Use local-temp from start to match participant ID
         name: trimmedName,
         avatarUrl: finalAvatarUrl,
         isHost: !targetHostId
@@ -651,9 +651,9 @@ const App: React.FC = () => {
 
   // Sync temp ID to real ID
   useEffect(() => {
-      if (meetingState === MeetingState.IN_MEETING && localUser?.id && localUser.id !== 'temp-init') {
+      if (meetingState === MeetingState.IN_MEETING && localUser?.id && localUser.id !== 'local-temp') {
           setParticipants(prev => prev.map(p => {
-              if (p.id === 'local-temp' || p.id === 'temp-init') {
+              if (p.id === 'local-temp') {
                   return { ...p, id: localUser!.id, name: localUser!.name };
               }
               return p;

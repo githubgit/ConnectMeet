@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Participant, ConnectionQuality } from '../types';
 import { Mic, MicOff, Wifi } from 'lucide-react';
 
@@ -9,12 +9,19 @@ interface VideoTileProps {
 
 export const VideoTile: React.FC<VideoTileProps> = ({ participant, isLocal = false }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const [imgError, setImgError] = useState(false);
+  const [imgLoaded, setImgLoaded] = useState(false);
+
+  // Reset image state if avatar url changes
+  useEffect(() => {
+    setImgError(false);
+    setImgLoaded(false);
+  }, [participant.avatarUrl]);
 
   // Handle stream attachment and ensure playback
   useEffect(() => {
     const videoEl = videoRef.current;
-    if (videoEl && participant.stream) {
-      // Check if stream actually changed to avoid unnecessary resets
+    if (videoEl && participant.stream && !participant.isVideoOff) {
       if (videoEl.srcObject !== participant.stream) {
         videoEl.srcObject = participant.stream;
         videoEl.onloadedmetadata = () => {
@@ -24,7 +31,7 @@ export const VideoTile: React.FC<VideoTileProps> = ({ participant, isLocal = fal
     } else if (videoEl) {
        videoEl.srcObject = null;
     }
-  }, [participant.stream]);
+  }, [participant.stream, participant.isVideoOff]); 
 
   const getQualityColor = (q: ConnectionQuality) => {
     switch (q) {
@@ -35,17 +42,38 @@ export const VideoTile: React.FC<VideoTileProps> = ({ participant, isLocal = fal
     }
   };
 
+  const getInitials = (name: string) => {
+    return (name || 'Guest')
+      .split(' ')
+      .map(n => n[0])
+      .join('')
+      .toUpperCase()
+      .slice(0, 2);
+  };
+
   return (
     <div className={`relative bg-gray-800 rounded-xl overflow-hidden aspect-video group ring-2 transition-all ${participant.isSpeaking ? 'ring-primary-500 shadow-lg shadow-primary-500/20' : 'ring-transparent'}`}>
       
-      {/* --- Video Content --- */}
+      {/* --- Content Area --- */}
       {participant.isVideoOff ? (
-        <div className="absolute inset-0 flex items-center justify-center bg-gray-750">
-          <img 
-            src={participant.avatarUrl} 
-            alt={participant.name} 
-            className="h-[60%] max-h-[300px] aspect-square rounded-full border-4 border-gray-600 object-cover shadow-2xl"
-          />
+        <div className="absolute inset-0 flex items-center justify-center bg-gray-750 p-4">
+           {/* Fallback/Base Layer: Initials */}
+           <div className="absolute flex items-center justify-center w-24 h-24 md:w-32 md:h-32 rounded-full bg-primary-600 border-4 border-gray-700 shadow-xl select-none z-0">
+                 <span className="text-3xl md:text-5xl font-bold text-white tracking-wider">
+                     {getInitials(participant.name)}
+                 </span>
+           </div>
+
+           {/* Top Layer: Image (if available and no error) */}
+           {!imgError && participant.avatarUrl && (
+             <img 
+               src={participant.avatarUrl} 
+               alt={participant.name} 
+               className={`relative w-24 h-24 md:w-32 md:h-32 rounded-full border-4 border-gray-700 object-cover shadow-xl z-10 transition-opacity duration-300 ${imgLoaded ? 'opacity-100' : 'opacity-0'}`}
+               onLoad={() => setImgLoaded(true)}
+               onError={() => setImgError(true)}
+             />
+           )}
         </div>
       ) : (
         <video 
@@ -58,21 +86,21 @@ export const VideoTile: React.FC<VideoTileProps> = ({ participant, isLocal = fal
       )}
 
       {/* --- Overlays --- */}
-      <div className="absolute bottom-3 left-3 flex items-center space-x-2 z-10">
+      <div className="absolute bottom-3 left-3 flex items-center space-x-2 z-20">
         <div className="bg-black/60 backdrop-blur-sm px-2 py-1 rounded-md text-xs font-medium text-white flex items-center gap-2">
            <span>{participant.name} {isLocal && '(You)'}</span>
            {participant.isMuted ? <MicOff size={12} className="text-red-400" /> : <Mic size={12} className="text-green-400" />}
         </div>
       </div>
 
-      <div className="absolute top-3 right-3 flex flex-col gap-2 items-end z-10">
+      <div className="absolute top-3 right-3 flex flex-col gap-2 items-end z-20">
          <div className="bg-black/40 backdrop-blur-sm p-1 rounded-full">
             <Wifi size={14} className={getQualityColor(participant.connectionQuality)} />
          </div>
       </div>
 
       {/* Floating Reactions */}
-      <div className="absolute inset-0 pointer-events-none overflow-hidden z-20">
+      <div className="absolute inset-0 pointer-events-none overflow-hidden z-30">
         {participant.reactions.map((reaction) => (
           <div 
             key={reaction.id}
@@ -85,7 +113,7 @@ export const VideoTile: React.FC<VideoTileProps> = ({ participant, isLocal = fal
       
       {/* Speaking Indicator Visualizer */}
       {participant.isSpeaking && !participant.isMuted && (
-         <div className="absolute bottom-3 right-3 flex gap-0.5 items-end h-4 z-10">
+         <div className="absolute bottom-3 right-3 flex gap-0.5 items-end h-4 z-20">
              <div className="w-1 bg-green-500 animate-[bounce_1s_infinite] h-full"></div>
              <div className="w-1 bg-green-500 animate-[bounce_1.2s_infinite] h-2/3"></div>
              <div className="w-1 bg-green-500 animate-[bounce_0.8s_infinite] h-full"></div>
