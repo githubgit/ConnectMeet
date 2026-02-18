@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Participant, Reaction, ConnectionQuality } from '../types';
-import { Mic, MicOff, Wifi, Aperture } from 'lucide-react';
+import { Participant, ConnectionQuality } from '../types';
+import { Mic, MicOff, Wifi } from 'lucide-react';
 
 interface VideoTileProps {
   participant: Participant;
@@ -17,102 +17,155 @@ export const VideoTile: React.FC<VideoTileProps> = ({ participant, isLocal = fal
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [segmentation, setSegmentation] = useState<any>(null);
-  const streamInitialized = useRef(false);
+  const [isSegmentationReady, setIsSegmentationReady] = useState(false);
+  const requestRef = useRef<number>(0);
+  const previousStreamId = useRef<string | null>(null);
 
-  // 1. Initialize Local Stream
-  useEffect(() => {
-    if (isLocal && !streamInitialized.current) {
-        // Local stream is handled by App.tsx passed down via participant.stream or similar,
-        // but for this component, we often grab it from props if available.
-        // However, the App logic attaches streams. 
-        // For consistency with the new App logic, we will check if participant.stream exists.
-    }
-  }, [isLocal]);
-
-  // Handle stream attachment for both Local and Remote
+  // Handle stream attachment and ensure playback
   useEffect(() => {
     const videoEl = videoRef.current;
-    if (videoEl) {
-        if (participant.stream) {
-            // Only update if different to prevent flickering
-            if (videoEl.srcObject !== participant.stream) {
-                videoEl.srcObject = participant.stream;
-            }
-        } else {
-            // Ensure we clear the source if stream is gone (e.g. leaving meeting)
-            videoEl.srcObject = null;
-        }
+    if (videoEl && participant.stream) {
+      // Check if stream actually changed to avoid unnecessary resets
+      if (videoEl.srcObject !== participant.stream) {
+        videoEl.srcObject = participant.stream;
+        videoEl.onloadedmetadata = () => {
+             videoEl.play().catch(e => console.error("Auto-play failed:", e));
+        };
+      }
+    } else if (videoEl) {
+       videoEl.srcObject = null;
     }
   }, [participant.stream]);
 
-  // 2. Initialize MediaPipe Segmentation (Only for Local)
+  // Initialize MediaPipe Segmentation (Only for Local)
   useEffect(() => {
-    if (isLocal && participant.isBlurredBackground && !segmentation && window.SelfieSegmentation) {
-        const seg = new window.SelfieSegmentation({
-             locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${file}`
-        });
-        seg.setOptions({ modelSelection: 1 }); // 1 for landscape/better quality
-        
-        seg.onResults((results: any) => {
-            const canvas = canvasRef.current;
-            if (!canvas) return;
-            const ctx = canvas.getContext('2d');
-            if (!ctx) return;
-
-            // Ensure canvas matches source dimensions
-            if (canvas.width !== results.image.width) {
-                canvas.width = results.image.width;
-                canvas.height = results.image.height;
-            }
-
-            ctx.save();
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-            // 1. Draw the Mask (Person shape)
-            // Apply a slight blur to the mask to feather the edges. 
-            ctx.filter = 'blur(4px)'; 
-            ctx.drawImage(results.segmentationMask, 0, 0, canvas.width, canvas.height);
-            ctx.filter = 'none';
-
-            // 2. Keep the Person (Source-In)
-            ctx.globalCompositeOperation = 'source-in';
-            ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
-
-            // 3. Draw Blurred Background behind (Destination-Over)
-            ctx.globalCompositeOperation = 'destination-over';
-            ctx.filter = 'blur(15px)';
-            ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
-
-            ctx.restore();
-        });
-
-        setSegmentation(seg);
-    }
-  }, [isLocal, participant.isBlurredBackground, segmentation]);
-
-  // 3. Frame Processing Loop
-  useEffect(() => {
-    let animationFrameId: number;
-    const processFrame = async () => {
-        if (
-            isLocal && 
-            participant.isBlurredBackground && 
-            !participant.isVideoOff && 
-            videoRef.current && 
-            segmentation && 
-            videoRef.current.readyState >= 2 // HAVE_CURRENT_DATA
-        ) {
-            await segmentation.send({ image: videoRef.current });
+    if (!isLocal || !participant.isBlurredBackground) {
+        if (segmentation) {
+            // Cleanup existing segmentation if disabled
+            setIsSegmentationReady(false);
+            setSegmentation(null);
+            try { segmentation.close(); } catch(e) {}
         }
-        animationFrameId = requestAnimationFrame(processFrame);
+        return;
+    }
+
+    if (segmentation) return; // Already initialized
+
+    let isActive = true;
+    let seg: any = null;
+
+    const initSegmentation = async () => {
+        if (!window.SelfieSegmentation) {
+             // Script hasn't loaded yet, retry shortly
+             setTimeout(initSegmentation, 200);
+             return;
+        }
+
+        try {
+            console.log("Initializing SelfieSegmentation...");
+            seg = new window.SelfieSegmentation({
+                 locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation@0.1.1675465747/${file}`
+            });
+            
+            await seg.setOptions({ modelSelection: 1 });
+            
+            seg.onResults((results: any) => {
+                if (!isActive) return;
+                
+                const canvas = canvasRef.current;
+                // If the component unmounted or canvas is gone, stop
+                if (!canvas) return;
+                
+                const ctx = canvas.getContext('2d');
+                if (!ctx) return;
+
+                // Sync canvas size with video frame
+                if (canvas.width !== results.image.width || canvas.height !== results.image.height) {
+                    canvas.width = results.image.width;
+                    canvas.height = results.image.height;
+                }
+
+                ctx.save();
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+                // 1. Draw the Segmentation Mask with blur for soft edges
+                ctx.filter = 'blur(4px)'; 
+                ctx.drawImage(results.segmentationMask, 0, 0, canvas.width, canvas.height);
+                ctx.filter = 'none';
+
+                // 2. Composite: Keep the Person (Source-In) using the mask
+                ctx.globalCompositeOperation = 'source-in';
+                ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
+
+                // 3. Composite: Draw Blurred Background behind (Destination-Over)
+                ctx.globalCompositeOperation = 'destination-over';
+                ctx.filter = 'blur(15px)';
+                ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
+
+                ctx.restore();
+                
+                setIsSegmentationReady(true);
+            });
+
+            if (isActive) {
+                setSegmentation(seg);
+            } else {
+                seg.close();
+            }
+        } catch (error) {
+            console.error("Failed to initialize selfie segmentation:", error);
+        }
     };
 
-    if (isLocal && participant.isBlurredBackground) {
-        processFrame();
+    initSegmentation();
+
+    return () => {
+        isActive = false;
+        if (seg) {
+            try { seg.close(); } catch(e) {}
+        }
+    };
+  }, [isLocal, participant.isBlurredBackground]); // Intentionally removed 'segmentation' from deps to avoid loop
+
+  // Frame Processing Loop
+  const processFrame = async () => {
+    const video = videoRef.current;
+    
+    if (
+        isLocal && 
+        participant.isBlurredBackground && 
+        segmentation && 
+        video && 
+        video.readyState >= 2 && // ReadyState 2 = HAVE_CURRENT_DATA
+        video.videoWidth > 0 && 
+        video.videoHeight > 0 &&
+        !participant.isVideoOff
+    ) {
+        try {
+             // Ensure video is playing
+             if (video.paused) await video.play();
+             
+             await segmentation.send({ image: video });
+        } catch (e) {
+             // console.warn("Frame processing error:", e);
+        }
     }
     
-    return () => cancelAnimationFrame(animationFrameId);
-  }, [isLocal, participant.isBlurredBackground, participant.isVideoOff, segmentation]);
+    requestRef.current = requestAnimationFrame(processFrame);
+  };
+
+  useEffect(() => {
+     if (isLocal && participant.isBlurredBackground && segmentation) {
+         requestRef.current = requestAnimationFrame(processFrame);
+     } else {
+         if (requestRef.current) cancelAnimationFrame(requestRef.current);
+         setIsSegmentationReady(false);
+     }
+     return () => {
+         if (requestRef.current) cancelAnimationFrame(requestRef.current);
+     };
+  }, [isLocal, participant.isBlurredBackground, segmentation, participant.isVideoOff]);
+
 
   const getQualityColor = (q: ConnectionQuality) => {
     switch (q) {
@@ -122,6 +175,11 @@ export const VideoTile: React.FC<VideoTileProps> = ({ participant, isLocal = fal
       default: return 'text-gray-500';
     }
   };
+
+  // We show raw video if blur is off, OR if blur is on but not ready yet (so user doesn't see black screen)
+  // BUT we only overlay the spinner if blur is requested and not ready.
+  const showBlurCanvas = isLocal && participant.isBlurredBackground && isSegmentationReady;
+  const showRawVideo = !participant.isVideoOff && !showBlurCanvas;
 
   return (
     <div className={`relative bg-gray-800 rounded-xl overflow-hidden aspect-video group ring-2 transition-all ${participant.isSpeaking ? 'ring-primary-500 shadow-lg shadow-primary-500/20' : 'ring-transparent'}`}>
@@ -137,21 +195,29 @@ export const VideoTile: React.FC<VideoTileProps> = ({ participant, isLocal = fal
         </div>
       ) : (
         <>
-            {/* Raw Video (Hidden when blurred locally, or Visible when normal) */}
+            {/* Raw Video */}
             <video 
                 ref={videoRef} 
                 autoPlay 
-                muted={isLocal || participant.isMuted} // Always mute local video to prevent echo
+                muted={isLocal || participant.isMuted} 
                 playsInline 
-                className={`w-full h-full object-cover transform -scale-x-100 absolute inset-0 ${isLocal && participant.isBlurredBackground ? 'opacity-0' : 'opacity-100'}`}
+                className={`w-full h-full object-cover transform -scale-x-100 absolute inset-0 transition-opacity duration-300 ${showRawVideo ? 'opacity-100' : 'opacity-0'}`}
             />
             
-            {/* Processed Canvas (Visible only when blurred and local) */}
-            {isLocal && (
-                <canvas 
-                    ref={canvasRef}
-                    className={`w-full h-full object-cover transform -scale-x-100 absolute inset-0 ${participant.isBlurredBackground ? 'opacity-100' : 'opacity-0'}`}
-                />
+            {/* Processed Canvas */}
+            <canvas 
+                ref={canvasRef}
+                className={`w-full h-full object-cover transform -scale-x-100 absolute inset-0 transition-opacity duration-300 ${showBlurCanvas ? 'opacity-100' : 'opacity-0'}`}
+            />
+            
+            {/* Loading Spinner for Blur */}
+            {isLocal && participant.isBlurredBackground && !isSegmentationReady && (
+                <div className="absolute inset-0 flex items-center justify-center z-20 pointer-events-none">
+                     <div className="bg-black/40 backdrop-blur-md p-3 rounded-2xl flex flex-col items-center gap-2">
+                        <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-white"></div>
+                        <span className="text-xs font-medium text-white/80">Initializing Blur...</span>
+                     </div>
+                </div>
             )}
         </>
       )}

@@ -316,9 +316,16 @@ const App: React.FC = () => {
       });
 
       peer.on('call', (call) => {
+          // IMPORTANT: Answer with local stream immediately
           if (localStreamRef.current) {
               call.answer(localStreamRef.current);
               handleMediaCall(call);
+          } else {
+             // Fallback if stream isn't ready, though it should be
+             navigator.mediaDevices.getUserMedia({ audio: true, video: true }).then(stream => {
+                 call.answer(stream);
+                 handleMediaCall(call);
+             }).catch(e => console.error("Failed to answer call", e));
           }
       });
 
@@ -336,11 +343,13 @@ const App: React.FC = () => {
   };
 
   const connectToHost = (hostPeerId: string, peer: Peer, myId: string, user: User) => {
+      // 1. Establish Data Connection for Metadata
       const conn = peer.connect(hostPeerId, {
           metadata: { name: user.name, avatarUrl: user.avatarUrl }
       });
       handleDataConnection(conn, user);
 
+      // 2. Establish Media Call for Stream
       if (localStreamRef.current) {
           const call = peer.call(hostPeerId, localStreamRef.current);
           handleMediaCall(call);
@@ -352,6 +361,7 @@ const App: React.FC = () => {
 
       conn.on('open', () => {
           const userToSend = userContext || localUser;
+          // Send my info to the peer
           if (userToSend) {
               conn.send({
                   type: 'USER_INFO',
@@ -379,23 +389,47 @@ const App: React.FC = () => {
       callsRef.current[call.peer] = call;
 
       call.on('stream', (remoteStream) => {
-          setParticipants(prev => prev.map(p => {
-              if (p.id === call.peer) {
-                  return { ...p, stream: remoteStream };
+          console.log("Received stream from:", call.peer);
+          // UPSERT LOGIC: Add stream to existing, or create new placeholder
+          setParticipants(prev => {
+              const existing = prev.find(p => p.id === call.peer);
+              if (existing) {
+                  // Participant exists, just attach stream
+                  return prev.map(p => p.id === call.peer ? { ...p, stream: remoteStream } : p);
+              } else {
+                  // Race condition: Stream arrived before USER_INFO. Create placeholder.
+                  return [...prev, {
+                      id: call.peer,
+                      name: 'Connecting...',
+                      avatarUrl: 'https://ui-avatars.com/api/?name=?',
+                      isHost: false,
+                      isMuted: false,
+                      isVideoOff: false,
+                      isScreenSharing: false,
+                      isBlurredBackground: false,
+                      isSpeaking: false,
+                      connectionQuality: ConnectionQuality.GOOD,
+                      reactions: [],
+                      stream: remoteStream // Attach stream immediately
+                  }];
               }
-              return p;
-          }));
+          });
       });
 
       call.on('close', () => {
           removeParticipant(call.peer);
+      });
+      
+      call.on('error', (err) => {
+          console.error("Media Call Error:", err);
       });
   };
 
   const handleIncomingData = (data: any, senderPeerId: string) => {
       switch (data.type) {
           case 'USER_INFO':
-              addParticipant(senderPeerId, data.payload);
+              // UPSERT LOGIC: Update metadata, preserve stream if exists
+              handleUserInfoUpdate(senderPeerId, data.payload);
               break;
           case 'UPDATE_STATE':
               updateParticipantState(data.payload.peerId, data.payload);
@@ -415,8 +449,12 @@ const App: React.FC = () => {
                break;
       }
 
+      // If I am NOT the host, and I receive info from someone who isn't the host and isn't me...
+      // share my peer list with them (mesh networking help)
       if (!hostId && data.type === 'USER_INFO') {
-          const existingPeers = participants.filter(p => p.id !== senderPeerId && p.id !== localUser?.id).map(p => ({ id: p.id }));
+          const existingPeers = participants
+            .filter(p => p.id !== senderPeerId && p.id !== localUser?.id)
+            .map(p => ({ id: p.id }));
           
           if (existingPeers.length > 0) {
              const conn = connectionsRef.current[senderPeerId];
@@ -425,6 +463,32 @@ const App: React.FC = () => {
              }
           }
       }
+  };
+
+  // Helper to robustly update user info without losing stream
+  const handleUserInfoUpdate = (id: string, info: any) => {
+      setParticipants(prev => {
+          const existing = prev.find(p => p.id === id);
+          if (existing) {
+              return prev.map(p => p.id === id ? { ...p, ...info } : p);
+          } else {
+              // New participant from Data connection (stream might come later)
+              return [...prev, {
+                  id: id,
+                  name: info.name || 'Guest',
+                  avatarUrl: info.avatarUrl || `https://ui-avatars.com/api/?name=Guest`,
+                  isHost: false, 
+                  isMuted: info.isMuted || false,
+                  isVideoOff: info.isVideoOff || false,
+                  isScreenSharing: false,
+                  isBlurredBackground: false,
+                  isSpeaking: false,
+                  connectionQuality: ConnectionQuality.GOOD,
+                  reactions: [],
+                  // Stream undefined initially
+              }];
+          }
+      });
   };
 
   const connectToPeer = (peerId: string) => {
@@ -437,25 +501,6 @@ const App: React.FC = () => {
           const call = peerRef.current.call(peerId, localStreamRef.current);
           handleMediaCall(call);
       }
-  };
-
-  const addParticipant = (id: string, info: any) => {
-      setParticipants(prev => {
-          if (prev.find(p => p.id === id)) return prev;
-          return [...prev, {
-              id: id,
-              name: info.name || 'Guest',
-              avatarUrl: info.avatarUrl || `https://ui-avatars.com/api/?name=Guest`,
-              isHost: false, 
-              isMuted: info.isMuted || false,
-              isVideoOff: info.isVideoOff || false,
-              isScreenSharing: false,
-              isBlurredBackground: false,
-              isSpeaking: false,
-              connectionQuality: ConnectionQuality.GOOD,
-              reactions: []
-          }];
-      });
   };
 
   const removeParticipant = (id: string) => {
@@ -733,7 +778,7 @@ const App: React.FC = () => {
     isMuted,
     isVideoOff,
     isScreenSharing: false,
-    isBlurredBackground: false,
+    isBlurredBackground: isBlurredBackground,
     isSpeaking: false,
     connectionQuality: ConnectionQuality.EXCELLENT,
     reactions: [],
