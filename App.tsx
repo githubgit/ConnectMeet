@@ -55,6 +55,7 @@ const App: React.FC = () => {
 
   // --- Refs for WebRTC & Processing ---
   const peerRef = useRef<Peer | null>(null);
+  const reconnectTimeoutRef = useRef<any>(null);
   
   // sourceStreamRef: The RAW camera/mic stream from getUserMedia. Always kept alive.
   const sourceStreamRef = useRef<MediaStream | null>(null);
@@ -87,17 +88,31 @@ const App: React.FC = () => {
 
   // Initialize MediaPipe Segmentation globally
   useEffect(() => {
+    let retryCount = 0;
+    const maxRetries = 20; // 10 seconds max
+
     const initSegmentation = async () => {
         if (window.SelfieSegmentation) {
-             const seg = new window.SelfieSegmentation({
-                 locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation@0.1.1675465747/${file}`
-             });
-             await seg.setOptions({ modelSelection: 1 });
-             seg.onResults(onSegmentationResults);
-             segmentationRef.current = seg;
+             try {
+                 const seg = new window.SelfieSegmentation({
+                     locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation@0.1.1675465747/${file}`
+                 });
+                 await seg.setOptions({ modelSelection: 1 });
+                 seg.onResults(onSegmentationResults);
+                 segmentationRef.current = seg;
+                 console.log("SelfieSegmentation initialized");
+             } catch (e) {
+                 console.error("Failed to initialize SelfieSegmentation:", e);
+                 setToastMessage("Blur effect unavailable (initialization failed)");
+             }
         } else {
-            // Retry if script not loaded
-            setTimeout(initSegmentation, 500);
+            if (retryCount < maxRetries) {
+                retryCount++;
+                setTimeout(initSegmentation, 500);
+            } else {
+                console.warn("SelfieSegmentation script not loaded after timeout");
+                // Don't show toast here to avoid spamming if user doesn't use blur
+            }
         }
     };
     initSegmentation();
@@ -118,39 +133,56 @@ const App: React.FC = () => {
       ctx.save();
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-      // Blur Mask
+      // 1. Draw the mask to the canvas
+      // We apply a slight blur to the mask to soften the edges
       ctx.filter = 'blur(4px)'; 
       ctx.drawImage(results.segmentationMask, 0, 0, canvas.width, canvas.height);
       ctx.filter = 'none';
 
-      // Keep Person
+      // 2. Draw the original image but only where the mask is (the person)
       ctx.globalCompositeOperation = 'source-in';
       ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
 
-      // Blur Background
+      // 3. Draw the blurred background
       ctx.globalCompositeOperation = 'destination-over';
+      
+      // Safari compatibility: Some versions have issues with filter if applied after globalCompositeOperation
       ctx.filter = 'blur(15px)';
       ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
 
       ctx.restore();
+      
+      // Safari fix: Ensure the stream is "warmed up" if it was just created
+      if (processedStreamRef.current && processedStreamRef.current.getVideoTracks().length === 0) {
+          console.log("Safari fix: Re-capturing stream as no tracks found");
+          processedStreamRef.current = canvas.captureStream(30);
+      }
   };
 
   const processVideoFrame = async () => {
       if (!isSegmentingRef.current) return;
 
+      const video = processingVideoRef.current;
       if (
-          processingVideoRef.current && 
+          video && 
           segmentationRef.current && 
-          !processingVideoRef.current.paused && 
-          !processingVideoRef.current.ended
+          !video.paused && 
+          !video.ended &&
+          video.readyState >= 2 // HAVE_CURRENT_DATA
       ) {
           try {
-              await segmentationRef.current.send({ image: processingVideoRef.current });
+              await segmentationRef.current.send({ image: video });
           } catch(e) {
-              // Ignore frames dropped during initialization or backgrounding
+              // Ignore frames dropped
           }
       }
-      requestRef.current = requestAnimationFrame(processVideoFrame);
+      
+      // Use requestVideoFrameCallback if available for better sync and performance
+      if (video && 'requestVideoFrameCallback' in video) {
+          (video as any).requestVideoFrameCallback(processVideoFrame);
+      } else {
+          requestRef.current = requestAnimationFrame(processVideoFrame);
+      }
   };
 
   // --- Stream Management ---
@@ -457,7 +489,41 @@ const App: React.FC = () => {
 
       peer.on('disconnected', () => {
           setPeerConnected(false);
-          if (peer && !peer.destroyed) peer.reconnect();
+          console.warn("PeerJS disconnected from server. Attempting to reconnect...");
+          
+          // Try to reconnect to the server
+          if (peer && !peer.destroyed) {
+              peer.reconnect();
+          }
+      });
+
+      peer.on('error', (err: any) => {
+          setPeerConnected(false);
+          console.error("PeerJS Error:", err.type, err);
+          
+          let msg = `Connection Error: ${err.type}`;
+          
+          if (err.type === 'peer-unavailable') {
+              msg = "Meeting ID not found.";
+          } else if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error') {
+              msg = "Lost connection to server. Retrying...";
+              
+              // If we lost connection to the server, try to re-initialize after a delay
+              if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+              reconnectTimeoutRef.current = setTimeout(() => {
+                  if (localUser) {
+                      console.log("Attempting to re-initialize PeerJS...");
+                      initializePeer(localUser, hostId);
+                  }
+              }, 5000);
+          } else if (err.type === 'unavailable-id') {
+              msg = "ID already in use. Retrying with new ID...";
+              setTimeout(() => {
+                  if (localUser) initializePeer(localUser, null);
+              }, 2000);
+          }
+          
+          setToastMessage(msg);
       });
 
       peer.on('connection', handleDataConnection);
@@ -476,13 +542,6 @@ const App: React.FC = () => {
                  handleMediaCall(call);
              });
           }
-      });
-
-      peer.on('error', (err: any) => {
-          setPeerConnected(false);
-          let msg = `Connection Error: ${err.type}`;
-          if (err.type === 'peer-unavailable') msg = "Meeting ID not found.";
-          setToastMessage(msg);
       });
   };
 
@@ -815,7 +874,8 @@ const App: React.FC = () => {
         
         {/* Hidden Processing Pipeline - Rendered off-screen to keep processing loop alive */}
         {/* We use opacity-0 instead of visibility-hidden because some browsers stop rendering/playing hidden videos */}
-        <div style={{ position: 'absolute', top: '-9999px', left: '-9999px', opacity: 0, pointerEvents: 'none' }}>
+        {/* Safari optimization: keep it in viewport (0,0) with 1px size to prevent aggressive background throttling */}
+        <div style={{ position: 'fixed', top: 0, left: 0, width: '1px', height: '1px', opacity: 0, pointerEvents: 'none', zIndex: -1, overflow: 'hidden' }}>
              <video 
                 ref={processingVideoRef} 
                 playsInline 
