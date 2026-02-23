@@ -43,6 +43,7 @@ const App: React.FC = () => {
   const [isScreenSharing, setIsScreenSharing] = useState(false);
   const [isBlurredBackground, setIsBlurredBackground] = useState(false);
   const [showChat, setShowChat] = useState(false);
+  const [showReactionPicker, setShowReactionPicker] = useState(false);
   const [streamReady, setStreamReady] = useState(false); 
   const [peerConnected, setPeerConnected] = useState(false);
   
@@ -196,12 +197,19 @@ const App: React.FC = () => {
       }
 
       // 4. Force UI refresh
-      setStreamReady(prev => !prev);
+      setStreamReady(true);
   };
 
   // --- Blur Toggle Effect ---
   useEffect(() => {
       if (!sourceStreamRef.current) return;
+
+      // Optimization: If video is off, stop processing to save resources and avoid glitches
+      if (isVideoOff) {
+          isSegmentingRef.current = false;
+          cancelAnimationFrame(requestRef.current);
+          return;
+      }
 
       const setupBlur = async () => {
           if (isBlurredBackground) {
@@ -254,7 +262,7 @@ const App: React.FC = () => {
       return () => {
           cancelAnimationFrame(requestRef.current);
       };
-  }, [isBlurredBackground, sourceStreamRef.current]);
+  }, [isBlurredBackground, sourceStreamRef.current, isVideoOff]);
 
   
   // Helper to start raw media stream
@@ -338,24 +346,76 @@ const App: React.FC = () => {
 
   const toggleMic = async () => {
     const newMuted = !isMuted;
-    setIsMuted(newMuted);
-
-    if (sourceStreamRef.current) {
-        sourceStreamRef.current.getAudioTracks().forEach(t => {
-            t.enabled = !newMuted; // Use enabled instead of stop() to keep track alive
-        });
+    
+    if (newMuted) {
+        // Mute: Stop the tracks to turn off hardware light
+        if (sourceStreamRef.current) {
+            sourceStreamRef.current.getAudioTracks().forEach(t => t.stop());
+        }
+        setIsMuted(true);
+    } else {
+        // Unmute: Get new stream
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            const newTrack = stream.getAudioTracks()[0];
+            
+            if (sourceStreamRef.current) {
+                // Clean up old tracks
+                sourceStreamRef.current.getAudioTracks().forEach(t => {
+                     sourceStreamRef.current?.removeTrack(t);
+                });
+                sourceStreamRef.current.addTrack(newTrack);
+            }
+            
+            // Replace in all active calls
+            Object.values(callsRef.current).forEach((call: any) => {
+                const sender = call.peerConnection?.getSenders().find((s: any) => s.track?.kind === 'audio');
+                if (sender) {
+                    sender.replaceTrack(newTrack).catch((e: any) => console.warn("Audio track replace failed", e));
+                }
+            });
+            
+            setIsMuted(false);
+        } catch (err) {
+            console.error("Error unmuting:", err);
+            setToastMessage("Could not access microphone");
+        }
     }
   };
 
   const toggleCamera = async () => {
     const newVideoOff = !isVideoOff;
-    setIsVideoOff(newVideoOff);
 
-    // We toggle the SOURCE tracks. Because processed stream is derived from source, this propagates.
-    if (sourceStreamRef.current) {
-        sourceStreamRef.current.getVideoTracks().forEach(t => {
-            t.enabled = !newVideoOff; 
-        });
+    if (newVideoOff) {
+        // Stop Video
+        if (sourceStreamRef.current) {
+            sourceStreamRef.current.getVideoTracks().forEach(t => t.stop());
+        }
+        setIsVideoOff(true);
+    } else {
+        // Start Video
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ 
+                video: { width: 640, height: 480 } 
+            });
+            const newTrack = stream.getVideoTracks()[0];
+            
+            if (sourceStreamRef.current) {
+                sourceStreamRef.current.getVideoTracks().forEach(t => {
+                    sourceStreamRef.current?.removeTrack(t);
+                });
+                sourceStreamRef.current.addTrack(newTrack);
+            }
+            
+            setIsVideoOff(false);
+            
+            // Refresh tracks to peers (useEffect will handle blur pipeline restart if needed)
+            refreshTracks();
+            
+        } catch (err) {
+            console.error("Error starting video:", err);
+            setToastMessage("Could not access camera");
+        }
     }
   };
 
@@ -754,8 +814,19 @@ const App: React.FC = () => {
         {renderToast()}
         
         {/* Hidden Processing Pipeline - Rendered off-screen to keep processing loop alive */}
-        <div style={{ position: 'absolute', top: '-1000px', left: '-1000px', visibility: 'hidden' }}>
-             <video ref={processingVideoRef} playsInline autoPlay muted width={640} height={480} />
+        {/* We use opacity-0 instead of visibility-hidden because some browsers stop rendering/playing hidden videos */}
+        <div style={{ position: 'absolute', top: '-9999px', left: '-9999px', opacity: 0, pointerEvents: 'none' }}>
+             <video 
+                ref={processingVideoRef} 
+                playsInline 
+                autoPlay 
+                muted 
+                width={640} 
+                height={480}
+                onLoadedMetadata={() => {
+                    processingVideoRef.current?.play().catch(e => console.log("Hidden video play error", e));
+                }}
+             />
              <canvas ref={processingCanvasRef} width={640} height={480} />
         </div>
 
@@ -799,89 +870,130 @@ const App: React.FC = () => {
                             <h2 className="text-3xl font-bold mb-2 text-white">{APP_NAME}</h2>
                             <p className="text-gray-400">{hostId ? 'You are joining a meeting.' : 'Start a new high-quality video meeting.'}</p>
                         </div>
-                        <form onSubmit={handleJoinMeeting} className="space-y-4">
-                             <div>
-                                <label className="block text-xs font-medium text-gray-400 mb-1 ml-1">DISPLAY NAME</label>
-                                <div className="relative">
-                                    <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-gray-500"><UserIcon size={18} /></div>
-                                    <input type="text" value={nameInput} onChange={(e) => setNameInput(e.target.value)} placeholder="Enter your full name" className="w-full bg-gray-950 border border-gray-700 text-white rounded-lg py-3 pl-10 pr-4 focus:ring-2 focus:ring-primary-500 outline-none" autoFocus />
-                                </div>
-                             </div>
-                             {!hostId && (
-                                 <div>
-                                    <label className="block text-xs font-medium text-gray-400 mb-1 ml-1">MEETING CODE (OPTIONAL)</label>
+
+                        <div className="space-y-4">
+                            <div>
+                                <label className="block text-sm font-medium text-gray-400 mb-1">Your Name</label>
+                                <input 
+                                    type="text" 
+                                    value={nameInput}
+                                    onChange={(e) => setNameInput(e.target.value)}
+                                    className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-3 text-white focus:ring-2 focus:ring-primary-500 focus:border-transparent transition-all"
+                                    placeholder="Enter your name"
+                                />
+                            </div>
+
+                            {!hostId && (
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-400 mb-1">Meeting Code (Optional)</label>
                                     <div className="relative">
-                                        <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-gray-500"><Hash size={18} /></div>
-                                        <input type="text" value={joinCodeInput} onChange={(e) => setJoinCodeInput(e.target.value)} placeholder="Enter code to join existing" className="w-full bg-gray-950 border border-gray-700 text-white rounded-lg py-3 pl-10 pr-4 focus:ring-2 focus:ring-primary-500 outline-none" />
-                                    </div>
-                                 </div>
-                             )}
-                             {hostId && (
-                                <div className="bg-gray-800/50 rounded-lg p-3 border border-gray-700 flex items-center justify-between">
-                                    <div className="overflow-hidden mr-4">
-                                        <p className="text-xs text-gray-400 mb-0.5 uppercase tracking-wider font-semibold">Meeting Code</p>
-                                        <p className="text-sm font-mono text-blue-400 truncate">{hostId}</p>
+                                        <Hash className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-500" size={18} />
+                                        <input 
+                                            type="text" 
+                                            value={joinCodeInput}
+                                            onChange={(e) => setJoinCodeInput(e.target.value)}
+                                            className="w-full bg-gray-800 border border-gray-700 rounded-lg pl-10 pr-4 py-3 text-white focus:ring-2 focus:ring-primary-500 focus:border-transparent transition-all"
+                                            placeholder="e.g. 74d9-2b1a"
+                                        />
                                     </div>
                                 </div>
                             )}
-                            <Button type="submit" disabled={!nameInput.trim()} className="w-full py-3 text-base flex items-center justify-center gap-2 group shadow-lg">
-                                {hostId ? 'Join Meeting' : (joinCodeInput.trim() ? 'Join Existing' : 'Start New Meeting')}
-                                <ArrowRight size={18} className="group-hover:translate-x-1 transition-transform" />
+
+                            <Button 
+                                onClick={handleJoinMeeting} 
+                                className="w-full py-3 text-lg shadow-lg shadow-primary-900/20" 
+                                disabled={!nameInput.trim() || !streamReady}
+                            >
+                                {hostId ? 'Join Meeting' : 'Start New Meeting'} <ArrowRight className="ml-2" size={18} />
                             </Button>
-                        </form>
+                        </div>
                     </div>
                  </div>
             </div>
         ) : (
-            <>
-                <div className="flex-1 flex overflow-hidden relative">
-                    <div className="flex-1 overflow-y-auto custom-scrollbar p-4 flex items-center justify-center">
-                        <div className={`grid ${gridClass} gap-4 w-full max-w-[1800px] auto-rows-fr transition-all duration-500`}>
-                            {participants.map((p) => (
-                                <VideoTile key={p.id} participant={p} isLocal={p.id === localUser?.id || p.id === 'local-temp'} />
-                            ))}
-                            {participants.length === 0 && (
-                                <div className="col-span-full flex flex-col items-center justify-center h-full text-gray-500 space-y-4">
-                                    <span>Connecting...</span>
-                                    {!peerConnected && <Button variant="secondary" size="sm" onClick={handleManualReconnect} className="gap-2"><RefreshCw size={14} /> Retry Connection</Button>}
-                                </div>
-                            )}
-                        </div>
-                    </div>
-                    {showChat && localUser && <ChatPanel messages={messages} currentUser={localUser} onSendMessage={handleSendMessage} onClose={() => setShowChat(false)} />}
+            <div className="flex-1 flex relative">
+                {/* Main Grid */}
+                <div className={`flex-1 p-4 grid gap-4 content-center justify-center overflow-y-auto w-full mx-auto transition-all duration-300 ${gridClass} ${showChat ? 'md:mr-96' : ''}`}>
+                    {participants.map(p => (
+                        <VideoTile key={p.id} participant={p} isLocal={p.id === localUser?.id} />
+                    ))}
                 </div>
 
-                <div className="h-20 bg-gray-900 border-t border-gray-800 flex items-center justify-between px-6 z-30 shrink-0">
-                    <div className="hidden md:flex items-center gap-3">
-                        <div className="flex flex-col">
-                            <span className="font-bold text-sm">Real-Time Meeting</span>
-                            <div className="flex items-center gap-2">
-                                {(meetingId || hostId) && <span className="text-xs text-gray-400 bg-gray-800 px-2 py-0.5 rounded font-mono select-all">ID: {meetingId || hostId}</span>}
-                                <span className="text-xs text-gray-400 flex items-center gap-1 cursor-pointer hover:text-white" onClick={handleCopyLink}>{(meetingId || hostId) ? 'Copy' : '...'} <Copy size={10} /></span>
+                {/* Chat Panel */}
+                <ChatPanel 
+                    messages={messages} 
+                    onSendMessage={handleSendMessage} 
+                    isOpen={showChat} 
+                    onClose={() => setShowChat(false)} 
+                />
+
+                {/* Bottom Bar */}
+                <div className="absolute bottom-6 left-1/2 transform -translate-x-1/2 bg-gray-900/90 backdrop-blur-xl border border-gray-700 rounded-2xl px-6 py-3 flex items-center gap-4 shadow-2xl z-40">
+                    <Button variant={isMuted ? 'danger' : 'secondary'} size="icon" onClick={toggleMic} tooltip={isMuted ? "Unmute" : "Mute"}>
+                        {isMuted ? <MicOff /> : <Mic />}
+                    </Button>
+                    <Button variant={isVideoOff ? 'danger' : 'secondary'} size="icon" onClick={toggleCamera} tooltip={isVideoOff ? "Turn Video On" : "Turn Video Off"}>
+                        {isVideoOff ? <VideoOff /> : <Video />}
+                    </Button>
+                    <Button variant="secondary" size="icon" active={isBlurredBackground} onClick={() => setIsBlurredBackground(!isBlurredBackground)} className={isBlurredBackground ? 'bg-primary-600 text-white' : ''} tooltip="Toggle Blur">
+                        <Aperture />
+                    </Button>
+                    
+                    <div className="w-px h-8 bg-gray-700 mx-2"></div>
+
+                    <Button variant="secondary" size="icon" onClick={() => setShowChat(!showChat)} active={showChat} tooltip="Chat">
+                        <MessageSquare />
+                        {messages.length > 0 && !showChat && (
+                            <span className="absolute top-0 right-0 w-3 h-3 bg-red-500 rounded-full border-2 border-gray-900"></span>
+                        )}
+                    </Button>
+                    <div className="relative">
+                        <Button variant="secondary" size="icon" onClick={() => setShowReactionPicker(!showReactionPicker)} active={showReactionPicker} tooltip="React">
+                            <Smile />
+                        </Button>
+                        {showReactionPicker && (
+                            <div className="absolute bottom-14 left-1/2 transform -translate-x-1/2 bg-gray-800 border border-gray-700 rounded-xl p-2 flex gap-2 shadow-xl animate-in fade-in slide-in-from-bottom-2">
+                                {REACTIONS_LIST.map(emoji => (
+                                    <button 
+                                        key={emoji}
+                                        onClick={() => {
+                                            handleReaction(emoji);
+                                            setShowReactionPicker(false);
+                                        }}
+                                        className="text-2xl hover:scale-125 transition-transform p-1"
+                                    >
+                                        {emoji}
+                                    </button>
+                                ))}
                             </div>
-                        </div>
+                        )}
                     </div>
+                    <Button variant="secondary" size="icon" onClick={handleCopyLink} tooltip="Copy Link">
+                        <Link />
+                    </Button>
 
-                    <div className="flex items-center gap-3">
-                        <Button variant="secondary" size="icon" active={!isMuted} onClick={toggleMic} className={isMuted ? 'bg-red-600 hover:bg-red-700' : ''} tooltip="Toggle Microphone">{isMuted ? <MicOff /> : <Mic />}</Button>
-                        <Button variant="secondary" size="icon" active={!isVideoOff} onClick={toggleCamera} className={isVideoOff ? 'bg-red-600 hover:bg-red-700' : ''} tooltip="Toggle Camera">{isVideoOff ? <VideoOff /> : <Video />}</Button>
-                        <div className="w-px h-8 bg-gray-700 mx-1"></div>
-                        <Button variant="secondary" size="icon" active={showChat} onClick={() => setShowChat(!showChat)} tooltip="Chat"><MessageSquare size={20} /></Button>
-                        <Button variant="secondary" size="icon" onClick={handleCopyLink} tooltip="Copy Invite Link"><Share size={20} /></Button>
-                        <div className="relative group">
-                             <Button variant="secondary" size="icon"><Smile size={20} /></Button>
-                             <div className="absolute bottom-full left-1/2 transform -translate-x-1/2 mb-4 bg-gray-800 rounded-full shadow-xl border border-gray-700 p-2 flex gap-1 invisible group-hover:visible transition-all opacity-0 group-hover:opacity-100">
-                                 {REACTIONS_LIST.map(emoji => <button key={emoji} onClick={() => handleReaction(emoji)} className="hover:bg-gray-700 p-2 rounded-full text-xl hover:scale-125 transition-transform">{emoji}</button>)}
-                             </div>
-                        </div>
-                        <Button variant="secondary" size="icon" active={isScreenSharing} onClick={() => setIsScreenSharing(!isScreenSharing)} className={isScreenSharing ? 'bg-green-600' : ''} tooltip="Share Screen"><MonitorUp size={20} /></Button>
-                        <Button variant="secondary" size="icon" active={isBlurredBackground} onClick={() => setIsBlurredBackground(!isBlurredBackground)} className={isBlurredBackground ? 'bg-primary-600' : ''} tooltip="Toggle Background Blur"><Aperture size={20} /></Button>
-                        <div className="w-px h-8 bg-gray-700 mx-1"></div>
-                        <Button variant="danger" className="px-6 rounded-full" onClick={handleLeaveMeeting}><PhoneOff size={20} className="mr-2" />Leave</Button>
-                    </div>
-                    <div className="hidden md:flex items-center gap-3"><Button variant="ghost" size="icon"><Settings size={20} /></Button></div>
+                    <div className="w-px h-8 bg-gray-700 mx-2"></div>
+
+                    <Button variant="danger" onClick={handleLeaveMeeting} className="px-6">
+                        <PhoneOff className="mr-2" size={18} /> Leave
+                    </Button>
                 </div>
-            </>
+                
+                {/* Connection Status Indicator */}
+                <div className="absolute top-4 left-4 flex items-center gap-2 bg-black/40 backdrop-blur px-3 py-1.5 rounded-full text-xs font-medium text-gray-400">
+                    <div className={`w-2 h-2 rounded-full ${peerConnected ? 'bg-green-500' : 'bg-red-500 animate-pulse'}`}></div>
+                    {peerConnected ? 'Connected' : 'Reconnecting...'}
+                    {!peerConnected && (
+                        <button onClick={handleManualReconnect} className="ml-2 hover:text-white"><RefreshCw size={12}/></button>
+                    )}
+                </div>
+                
+                {/* Meeting ID Badge */}
+                <div className="absolute top-4 right-4 bg-black/40 backdrop-blur px-3 py-1.5 rounded-full text-xs font-mono text-gray-400 border border-white/5 flex items-center gap-2">
+                    <span>ID: {meetingId || '...'}</span>
+                    <button onClick={handleCopyLink} className="hover:text-white"><Copy size={12}/></button>
+                </div>
+            </div>
         )}
     </div>
   );
