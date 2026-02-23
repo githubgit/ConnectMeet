@@ -464,7 +464,10 @@ const App: React.FC = () => {
                   { urls: 'stun:stun1.l.google.com:19302' },
               ]
           },
-          debug: 1
+          debug: 1,
+          secure: true,
+          pingInterval: 5000,
+          serialization: 'json'
       });
 
       peer.on('open', (id) => {
@@ -804,9 +807,9 @@ const App: React.FC = () => {
   const handleCopyLink = () => {
     const idToShare = meetingId || hostId; 
     if (idToShare) {
-        navigator.clipboard.writeText(isPreviewEnv ? idToShare : `${window.location.href.split('?')[0]}?meet=${idToShare}`)
+        navigator.clipboard.writeText(idToShare)
             .then(() => {
-                setToastMessage(isPreviewEnv ? "Code Copied" : "Link Copied");
+                setToastMessage("Meeting Code Copied");
                 setTimeout(() => setToastMessage(null), 3000);
             });
     }
@@ -1028,7 +1031,7 @@ const App: React.FC = () => {
                             </div>
                         )}
                     </div>
-                    <Button variant="secondary" size="icon" onClick={handleCopyLink} tooltip="Copy Link">
+                    <Button variant="secondary" size="icon" onClick={handleCopyLink} tooltip="Copy Meeting Code">
                         <Link />
                     </Button>
 
