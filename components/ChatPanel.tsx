@@ -116,6 +116,8 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ messages, onSendMessage, i
       <form onSubmit={handleSubmit} className="p-4 bg-gray-900 border-t border-gray-800">
         <div className={`relative flex items-center bg-gray-800 rounded-xl border transition-colors ${isAiMode ? 'border-purple-500/50 ring-1 ring-purple-500/20' : 'border-gray-700 focus-within:border-primary-500'}`}>
           <input
+            id="chat-input"
+            name="message"
             type="text"
             value={inputText}
             onChange={(e) => setInputText(e.target.value)}

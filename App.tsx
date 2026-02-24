@@ -458,16 +458,21 @@ const App: React.FC = () => {
       const targetHostId = overrideHostId !== undefined ? overrideHostId : hostId;
       
       const peer = new Peer({
+          host: '0.peerjs.com',
+          port: 443,
+          path: '/',
+          secure: true,
           config: {
               iceServers: [
                   { urls: 'stun:stun.l.google.com:19302' },
                   { urls: 'stun:stun1.l.google.com:19302' },
+                  { urls: 'stun:stun2.l.google.com:19302' },
+                  { urls: 'stun:stun3.l.google.com:19302' },
+                  { urls: 'stun:stun4.l.google.com:19302' },
               ]
           },
           debug: 1,
-          secure: true,
           pingInterval: 5000,
-          serialization: 'json'
       });
 
       peer.on('open', (id) => {
@@ -494,9 +499,11 @@ const App: React.FC = () => {
           setPeerConnected(false);
           console.warn("PeerJS disconnected from server. Attempting to reconnect...");
           
-          // Try to reconnect to the server
+          // Try to reconnect to the server with a delay to avoid thrashing
           if (peer && !peer.destroyed) {
-              peer.reconnect();
+              setTimeout(() => {
+                  if (peer && !peer.destroyed) peer.reconnect();
+              }, 2000);
           }
       });
 
